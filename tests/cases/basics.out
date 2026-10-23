@@ -1,0 +1,18 @@
+9 5 14 3.5 3 1 1024
+-4 2 -2 -4.0 1.5 0.5
+3.5 4.5 2.5 1000.0 0.30000000000000004 31 1000000
+-4 4 512
+5 2.5 2 4 2.67 3 -3 2.0
+42 1.5 1 12! False True False
+True True False True True True True True True
+True True True True
+default y 0 True False
+2 3 False
+[False, True, False, False, True, False, True, False, True, False, True, False]
+big odd
+3
+int float str list dict NoneType bool builtin_function
+2 1
+60
+200
+4611686018427387904 9223372036854775807

@@ -1,0 +1,15 @@
+let s = "Hello, World";
+print(len(s), s[0], s[-1], s[7:], s[:5], s[::-1], s.upper(), s.lower());
+print(s.find("World"), s.find("zzz"), s.replace("World", "Faston"), s.startswith("Hell"), s.endswith("x"));
+print("  pad  ".strip() + "|", "xxhixx".strip("x"), "a,b,,c".split(","), "one two  three".split());
+print("-".join(["a", "b", "c"]), "".join([]), "ab" * 3, "abc" + "def");
+print("12".isdigit(), "1a".isdigit(), "abc".isalpha(), "   ".isspace(), "banana".count("an"));
+print(repr("it's"), repr('say "hi"'), repr("tab\there"), str(3.0), str([1, "a"]));
+let name = "Ada";
+let score = 1234.5678;
+print(f"{name} scored {score:.2f} ({score:,.1f}) [{name:>6}] [{name:<6}] [{name:^7}]");
+print(f"{42:05d} {255:x} {255:X} {5:b} {0.25:.0%} {-3:+d} {7:+d} {12345678:,}");
+print(f"nested {[1, 2][1]} {len('abc')} {{literal}} {'yes' if score > 1000 else 'no'}");
+print("héllo wörld".upper(), len("héllo"), "héllo"[1], "日本語"[1:]);
+print(chr(65), ord("A"), ord("é"), "abc" < "abd", "Z" < "a");
+print(format(3.14159, ".3f"), format(42, ">5"), format("x", "*^5"));

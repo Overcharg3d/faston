@@ -1,0 +1,11 @@
+hero:95 x3 slime:-5 BOSS dragon
+True False 500
+True True False True
+Player hero <class 'Player'>
+['hero:95 x3', 'slime:-5', 'BOSS dragon', 'rat:1', 'ally:120 x1']
+[95, -5, 500, 1, 120]
+hero:95 x3
+42 3
+method method
+field method
+1 True False

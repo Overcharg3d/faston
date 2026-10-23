@@ -1,0 +1,2 @@
+line 1, in f
+TypeError: unsupported operand type(s) for +: 'str' and 'int'

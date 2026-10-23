@@ -1,0 +1,16 @@
+slime@(0,0) hp=100 bat@(3,0) hp=100 orc@(0,5) hp=100 boss@(9,0) hp=1
+0 6 15
+['a', (), {}] ['b', (1, 2), {'debug': True, 'level': 3}]
+x@(10,20) hp=100 z@(0,2) hp=7 w@(1,0) hp=100
+wrapped@(0,0) hp=55
+rat 3 () {} 50 ('fast', 'fire') {'loot': 'gold'} 7 8
+[3, 2, 1] ['a', 'bb', 'ccc'] ['ccc', 'bb', 'a']
+['apple', 'date', 'fig', 'kiwi'] apple fig none
+1-2-3!
+ab
+[(10, 'a'), (11, 'b')]
+6 3
+spawn() missing 1 required positional argument: 'name'
+spawn() got an unexpected keyword argument 'nope'
+spawn() got multiple values for argument 'name'
+print() got an unexpected keyword argument 'color'

@@ -1,0 +1,7 @@
+loading _enemies
+3 3 30 50
+5 main _enemies-module 4.0
+6 module <module '_enemies'>
+100 50 101
+1.0 42
+from b from a

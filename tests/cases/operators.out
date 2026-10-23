@@ -1,0 +1,13 @@
+Vec2(4, 6) Vec2(-2, -2) Vec2(3, 6) Vec2(2, 4) Vec2(1.5, 2.0) Vec2(-1, -2)
+True False False True True True
+2 1 2 [1, 2] Vec2(3, 4) Vec2(3, 4) pos=Vec2(1, 2)
+3 4 [3, 4]
+[Vec2(0, 1), Vec2(1, 2), Vec2(3, 4)] Vec2(1, 2) Vec2(3, 4)
+True False
+Vec2(15, 18) [Vec2(1, 2), Vec2(3, 4)] {'pos': Vec2(1, 2)} (Vec2(1, 2),)
+False zero
+Counter(6) 6 True True False yes
+# .
+$6 $15 $15
+error: 'int' object has no attribute 'x'
+error: '<' not supported between instances of 'Counter' and 'Counter'

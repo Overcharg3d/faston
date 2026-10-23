@@ -1,0 +1,24 @@
+missing key 'b' KeyError("'b'") KeyError
+parsed 12
+finally for '12'
+bad: invalid literal for int(): 'x'
+finally for 'x'
+12 None
+lookup: list index out of range
+ZeroDivisionError True
+caught OutOfMana need 10, have 3 10
+class raise: GameError('')
+inner finally
+outer caught inner
+re-raised: inner
+from callback: bad item
+[0, 'f0', 'f1', 2, 'f2', 'f3']
+cleanup runs
+from try
+finally after handler error
+got from handler
+bare except caught assertion
+recursion caught: maximum recursion depth exceeded
+still running True
+[1, 'ValueError', 3]
+10990
