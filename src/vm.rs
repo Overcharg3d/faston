@@ -157,8 +157,19 @@ class AssertionError(Exception) { pass; }
 class ImportError(Exception) { pass; }
 class OSError(Exception) { pass; }
 class IOError(OSError) { pass; }
+class FileNotFoundError(OSError) { pass; }
+class FileExistsError(OSError) { pass; }
+class PermissionError(OSError) { pass; }
+class IsADirectoryError(OSError) { pass; }
+class NotADirectoryError(OSError) { pass; }
+class TimeoutError(OSError) { pass; }
+class EOFError(Exception) { pass; }
+class ModuleNotFoundError(ImportError) { pass; }
+class UnicodeError(ValueError) { pass; }
+class JSONDecodeError(ValueError) { pass; }
 class SyntaxError(Exception) { pass; }
 class StopIteration(Exception) { pass; }
+class KeyboardInterrupt(BaseException) { pass; }
 "#;
 
 impl Frame {
@@ -224,6 +235,10 @@ pub struct Vm {
     jit: Option<Box<jit::Jit>>,
     /// Source files bundled into a built executable, by module name.
     pub bundle: Option<HashMap<String, String>>,
+    /// Files opened by the program, flushed when it ends (even without close()).
+    pub open_files: Vec<std::rc::Weak<std::cell::RefCell<crate::fileio::Stream>>>,
+    /// Command-line arguments for `sys.argv` (argv[0] is the script).
+    pub argv: Vec<String>,
 }
 
 impl Default for Vm {
@@ -276,6 +291,8 @@ impl Vm {
             jit_err: String::new(),
             jit: None,
             bundle: None,
+            open_files: Vec::new(),
+            argv: Vec::new(),
         };
         vm.stack_ptr = vm.stack.as_mut_ptr();
         if compiled {
@@ -424,8 +441,20 @@ impl Vm {
     pub fn run_source(&mut self, src: &str) -> Result<(), String> {
         let script = self.compile_unit(self.main, src)?;
         let r = self.execute(script);
-        let _ = self.out.flush();
+        self.flush_all();
         r.map(|_| ())
+    }
+
+    /// Flushes stdout and every file the program still has open.
+    pub fn flush_all(&mut self) {
+        let _ = self.out.flush();
+        self.open_files.retain(|w| match w.upgrade() {
+            Some(s) => {
+                crate::fileio::flush_stream(&mut s.borrow_mut());
+                true
+            }
+            None => false,
+        });
     }
 
     /// Compiles `src` and returns a human-readable bytecode listing (`faston --dis`).
@@ -751,7 +780,34 @@ impl Vm {
             }
             return ops::to_vec(&mut self.heap, it);
         }
+        if let Some(items) = self.handle_iter(v)? {
+            return ops::to_vec(&mut self.heap, items);
+        }
         ops::to_vec(&mut self.heap, v)
+    }
+
+    /// For native handles that can be iterated (files: their lines), the items as a list.
+    pub fn handle_iter(&mut self, v: Value) -> Result<Option<Value>, String> {
+        if let Value::Obj(g) = v {
+            if let Obj::Handle(h) = g.get() {
+                let method = h.ty.method;
+                return match method(self, g, "__iter__", &[]) {
+                    Some(r) => r.map(Some),
+                    None => Err(format!("TypeError: '{}' object is not iterable", v.type_name())),
+                };
+            }
+        }
+        Ok(None)
+    }
+
+    /// `getattr(obj, name)` for natives.
+    pub fn get_attr(&mut self, obj: Value, name: u32) -> Result<Value, String> {
+        self.load_attr(obj, name).map(|(v, _)| v)
+    }
+
+    /// `setattr(obj, name, v)` for natives.
+    pub fn set_attr(&mut self, obj: Value, name: u32, v: Value) -> Result<(), String> {
+        self.store_attr(obj, name, v).map(|_| ())
     }
 
     /// `len(v)`, honouring `__len__`.
@@ -1082,6 +1138,26 @@ impl Vm {
         self.modules.insert(sym, Value::Obj(module));
     }
 
+    /// A registered built-in module.
+    pub fn module(&mut self, name: &str) -> Option<Value> {
+        let s = self.syms.intern(name);
+        self.modules.get(&s).copied()
+    }
+
+    /// Sets `sys.argv` (argv[0] is the script path).
+    pub fn set_argv(&mut self, args: Vec<String>) {
+        let vals: Vec<Value> = args.iter().map(|a| self.heap.string(a.clone())).collect();
+        if let Some(sys) = self.module("sys") {
+            let argv = self.syms.intern("argv");
+            if let Ok(Value::Obj(g)) = self.get_attr(sys, argv) {
+                if let Obj::List(l) = g.get_mut() {
+                    *l = vals;
+                }
+            }
+        }
+        self.argv = args;
+    }
+
     pub fn native(&mut self, name: &'static str, func: NativeFn) -> Value {
         Value::Obj(self.heap.alloc(Obj::Native(Native { name, func, kwargs: &[] })))
     }
@@ -1231,6 +1307,11 @@ impl Vm {
         Some(self.kwargs.remove(i).1)
     }
 
+    /// All keyword arguments of the running native (for natives that accept any).
+    pub fn take_all_kw(&mut self) -> Vec<(u32, Value)> {
+        std::mem::take(&mut self.kwargs)
+    }
+
     /// Calls native `n` with positional `args` and keyword `kws`.
     fn call_native_kw(&mut self, func: NativeFn, fname: &str, args_at: usize, npos: usize, kws: Vec<(u32, Value)>) -> Result<Value, String> {
         let saved = std::mem::replace(&mut self.kwargs, kws);
@@ -1295,7 +1376,8 @@ impl Vm {
                 _ => Err(format!("TypeError: '{}' object is not callable", v.type_name())),
             },
             Obj::Native(n) => {
-                if let Some((k, _)) = kws.iter().find(|(k, _)| !n.kwargs.contains(k)) {
+                let any = n.kwargs.contains(&sym::ANY);
+                if let Some((k, _)) = kws.iter().find(|(k, _)| !any && !n.kwargs.contains(k)) {
                     return Err(format!(
                         "TypeError: {}() got an unexpected keyword argument '{}'",
                         n.name,
@@ -1375,9 +1457,18 @@ impl Vm {
                 _ => {}
             }
         }
-        // Built-in methods: only list.sort takes keyword arguments.
-        let allowed: &[u32] = if name == sym::SORT { &[sym::KEY, sym::REVERSE] } else { &[] };
-        if let Some((k, _)) = kws.iter().find(|(k, _)| !allowed.contains(k)) {
+        // Keyword arguments of built-in methods (handles read their own).
+        let is_handle = matches!(rv, Value::Obj(g) if matches!(g.get(), Obj::Handle(_)));
+        let allowed: &[u32] = match name {
+            _ if is_handle => sym::ANY_KW,
+            sym::SORT => &[sym::KEY, sym::REVERSE],
+            sym::SPLIT | sym::RSPLIT => &[sym::SEP, sym::MAXSPLIT],
+            sym::SPLITLINES => &[sym::KEEPENDS],
+            sym::FORMAT | sym::UPDATE => sym::ANY_KW,
+            _ => &[],
+        };
+        let any = allowed.contains(&sym::ANY);
+        if let Some((k, _)) = kws.iter().find(|(k, _)| !any && !allowed.contains(k)) {
             return Err(format!(
                 "TypeError: {}.{}() got an unexpected keyword argument '{}'",
                 rv.type_name(),
@@ -1722,6 +1813,13 @@ impl Vm {
                     };
                 }
                 Obj::Module(m) => return self.module_attr(m.unit, name, &m.name),
+                Obj::Handle(h) => {
+                    let attr = h.ty.attr;
+                    let n = self.syms.name(name).to_string();
+                    if let Some(r) = attr(self, g, &n) {
+                        return r;
+                    }
+                }
                 Obj::Class(c) => {
                     return c.method(name).ok_or_else(|| {
                         format!(
@@ -1777,6 +1875,11 @@ impl Vm {
                             return Err("TypeError: __iter__ must return a list, tuple or other built-in iterable".into());
                         }
                         return self.get_iter_state(it);
+                    }
+                }
+                Obj::Handle(_) => {
+                    if let Some(items) = self.handle_iter(v)? {
+                        return self.get_iter_state(items);
                     }
                 }
                 _ => {}

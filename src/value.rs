@@ -17,6 +17,34 @@ use crate::vm::Vm;
 
 pub type NativeFn = fn(&mut Vm, &[Value]) -> Result<Value, String>;
 
+/// A native resource owned by the heap (an open file, a GUI object, ...). It is
+/// dropped (closing the file, say) when the collector frees it. Handles never
+/// hold `Value`s, so the collector doesn't need to look inside them.
+pub struct Handle {
+    pub ty: &'static HandleType,
+    pub data: Box<dyn std::any::Any>,
+}
+
+/// Behaviour shared by all handles of one kind.
+pub struct HandleType {
+    /// The type name Faston code sees (`type(f)`, error messages).
+    pub name: &'static str,
+    /// `obj.name(args)`; `None` = no such method.
+    pub method: fn(&mut Vm, Gc, &str, &[Value]) -> Option<Result<Value, String>>,
+    /// `obj.name`; `None` = no such attribute.
+    pub attr: fn(&mut Vm, Gc, &str) -> Option<Result<Value, String>>,
+    pub repr: fn(&Handle) -> String,
+}
+
+impl Handle {
+    pub fn get<T: 'static>(&self) -> Option<&T> {
+        self.data.downcast_ref::<T>()
+    }
+    pub fn get_mut<T: 'static>(&mut self) -> Option<&mut T> {
+        self.data.downcast_mut::<T>()
+    }
+}
+
 #[derive(Clone, Copy)]
 #[repr(u64)] // full-width tag: no padding bytes to copy, two plain stores per write
 pub enum Value {
@@ -58,6 +86,7 @@ pub mod kind {
     pub const MODULE: u8 = 11;
     pub const TUPLE: u8 = 12;
     pub const SET: u8 = 13;
+    pub const HANDLE: u8 = 14;
 }
 
 impl Obj {
@@ -77,6 +106,7 @@ impl Obj {
             Obj::Module(_) => kind::MODULE,
             Obj::Tuple(_) => kind::TUPLE,
             Obj::Set(_) => kind::SET,
+            Obj::Handle(_) => kind::HANDLE,
         }
     }
 }
@@ -165,6 +195,8 @@ pub enum Obj {
     Tuple(Box<[Value]>),
     /// Insertion-ordered set (a `Dict` whose values are unused).
     Set(Box<Dict>),
+    /// Native resource (file, GUI object, ...).
+    Handle(Box<Handle>),
 }
 
 /// A function together with the variables it captured from enclosing functions.
@@ -446,6 +478,51 @@ pub mod sym {
     pub const ISSUPERSET: u32 = 79;
     pub const ISDISJOINT: u32 = 80;
     pub const DEFAULT: u32 = 81;
+    pub const TITLE: u32 = 82;
+    pub const CAPITALIZE: u32 = 83;
+    pub const SWAPCASE: u32 = 84;
+    pub const ZFILL: u32 = 85;
+    pub const CENTER: u32 = 86;
+    pub const LJUST: u32 = 87;
+    pub const RJUST: u32 = 88;
+    pub const SPLITLINES: u32 = 89;
+    pub const PARTITION: u32 = 90;
+    pub const RPARTITION: u32 = 91;
+    pub const RSPLIT: u32 = 92;
+    pub const RFIND: u32 = 93;
+    pub const RINDEX: u32 = 94;
+    pub const REMOVEPREFIX: u32 = 95;
+    pub const REMOVESUFFIX: u32 = 96;
+    pub const ISUPPER: u32 = 97;
+    pub const ISLOWER: u32 = 98;
+    pub const ISALNUM: u32 = 99;
+    pub const ISNUMERIC: u32 = 100;
+    pub const ISDECIMAL: u32 = 101;
+    pub const ISTITLE: u32 = 102;
+    pub const ISIDENTIFIER: u32 = 103;
+    pub const FORMAT: u32 = 104;
+    pub const SETDEFAULT: u32 = 105;
+    pub const POPITEM: u32 = 106;
+    pub const CASEFOLD: u32 = 107;
+    pub const MAXSPLIT: u32 = 108;
+    pub const D_ENTER: u32 = 109;
+    pub const D_EXIT: u32 = 110;
+    pub const D_NEXT: u32 = 111;
+    pub const D_DELITEM: u32 = 112;
+    pub const FILE: u32 = 113;
+    pub const FLUSH: u32 = 114;
+    pub const INDENT: u32 = 115;
+    pub const SORT_KEYS: u32 = 116;
+    pub const ENCODING: u32 = 117;
+    pub const MODE: u32 = 118;
+    pub const EXIST_OK: u32 = 119;
+    pub const EXPANDTABS: u32 = 120;
+    pub const ISASCII: u32 = 121;
+    pub const KEEPENDS: u32 = 122;
+
+    /// In a native's keyword list: accept any keyword (the native reads them itself).
+    pub const ANY: u32 = u32::MAX;
+    pub const ANY_KW: &[u32] = &[ANY];
 
     pub const PREDEFINED: &[&str] = &[
         "init", "append", "extend", "pop", "insert", "remove", "index", "count", "clear",
@@ -461,6 +538,13 @@ pub mod sym {
         "message", "key", "sep", "end", "start",
         "add", "discard", "union", "intersection", "difference", "symmetric_difference",
         "issubset", "issuperset", "isdisjoint", "default",
+        "title", "capitalize", "swapcase", "zfill", "center", "ljust", "rjust", "splitlines",
+        "partition", "rpartition", "rsplit", "rfind", "rindex", "removeprefix", "removesuffix",
+        "isupper", "islower", "isalnum", "isnumeric", "isdecimal", "istitle", "isidentifier",
+        "format", "setdefault", "popitem", "casefold", "maxsplit",
+        "__enter__", "__exit__", "__next__", "__delitem__",
+        "file", "flush", "indent", "sort_keys", "encoding", "mode", "exist_ok", "expandtabs",
+        "isascii", "keepends",
     ];
 }
 
@@ -607,7 +691,7 @@ impl Heap {
     pub fn finish_collection(&mut self) {
         while let Some(g) = self.gray.pop() {
             match g.get() {
-                Obj::Str(_) | Obj::Range(_) | Obj::Native(_) => {}
+                Obj::Str(_) | Obj::Range(_) | Obj::Native(_) | Obj::Handle(_) => {}
                 Obj::List(v) => {
                     for x in v.iter() {
                         self.mark(*x);
@@ -799,7 +883,7 @@ pub fn to_key(v: Value) -> Result<Key, String> {
         Value::Obj(g) => match g.get() {
             Obj::Str(_) => Key::Str(g),
             Obj::Func(_) | Obj::Native(_) | Obj::Class(_) | Obj::Instance(_) | Obj::Closure(_)
-            | Obj::Module(_) => Key::Ptr(g.addr()),
+            | Obj::Module(_) | Obj::Handle(_) => Key::Ptr(g.addr()),
             Obj::Tuple(t) => {
                 for x in t.iter() {
                     to_key(*x)?;
@@ -894,6 +978,7 @@ impl Value {
                 Obj::Closure(_) => "function".into(),
                 Obj::Upvalue(_) => "upvalue".into(),
                 Obj::Module(_) => "module".into(),
+                Obj::Handle(h) => h.ty.name.into(),
             },
         }
     }
@@ -1053,6 +1138,7 @@ impl Value {
                 Obj::Module(m) => {
                     let _ = write!(out, "<module '{}'>", m.name);
                 }
+                Obj::Handle(h) => out.push_str(&(h.ty.repr)(h)),
             },
         }
     }

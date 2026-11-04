@@ -1,0 +1,57 @@
+11 True w False
+True
+'first line\n' 'sec' 'ond\n'
+['third\n', 'fourth\n']
+'' ''
+ValueError: I/O operation on closed file.
+chars 31 31
+'first' 5
+a|1|[2, 3]!
+second
+['x\n', 'y\n']
+FileNotFoundError caught: True
+FileExistsError caught
+['crlf.txt', 'notes.txt', 'printed.txt', 'sub']
+True False True False
+c.txt a/b ('a/b/c.tar', '.gz') ('.bashrc', '')
+('a/b', 'c.txt')  ('noext', '')
+31 True False
+. ['sub'] ['crlf.txt', 'notes.txt', 'printed.txt']
+sub ['deeper'] ['moved.txt']
+sub/deeper [] []
+['deeper']
+None fallback
+list True str 9223372036854775807
+{"name": "Ann", "tags": ["a", "b"], "n": 3, "pi": 3.5, "ok": true, "none": null, "nested": {"x": [1, {"y": []}]}}
+{
+  "n": 3,
+  "name": "Ann",
+  "nested": {
+    "x": [
+      1,
+      {
+        "y": []
+      }
+    ]
+  },
+  "none": null,
+  "ok": true,
+  "pi": 3.5,
+  "tags": [
+    "a",
+    "b"
+  ]
+}
+[1, "\u00e9", "\n\"q\""] "é" {} []
+{"1": "t", "null": "n"} [1, 2] [1.0, 1e+20, -0.5]
+True [1, 2.5, True, None, 'é\n']
+{'a': {'b': [1, 2, {'c': False}]}}
+{'x': [1, {'y': []}]}
+error: Expecting value: line 1 column 1 (char 0)
+error: Expecting ',' delimiter: line 1 column 6 (char 5)
+error: Expecting ':' delimiter: line 1 column 6 (char 5)
+error: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)
+error: Extra data: line 1 column 5 (char 4)
+error: Expecting value: line 1 column 1 (char 0)
+TypeError: Object of type set is not JSON serializable
+False

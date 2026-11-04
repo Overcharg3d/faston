@@ -52,7 +52,8 @@ fn want_str<'a>(v: Value, what: &str) -> Result<&'a str, String> {
 }
 
 pub fn register(vm: &mut Vm) {
-    vm.define_native_kw("print", print, &[sym::SEP, sym::END]);
+    vm.define_native_kw("print", print, &[sym::SEP, sym::END, sym::FILE, sym::FLUSH]);
+    vm.define_native_kw("open", crate::fileio::open_native, &[sym::MODE, sym::ENCODING]);
     vm.define_native("input", input);
     vm.define_native("len", len);
     vm.define_native("range", range);
@@ -87,7 +88,185 @@ pub fn register(vm: &mut Vm) {
     vm.define_native("any", any_native);
     vm.define_native("all", all_native);
     vm.define_native("callable", callable_native);
+    vm.define_native_kw("dict", dict_native, sym::ANY_KW);
+    vm.define_native("divmod", divmod_native);
+    vm.define_native("pow", pow_native);
+    vm.define_native("hex", hex_native);
+    vm.define_native("oct", oct_native);
+    vm.define_native("bin", bin_native);
+    vm.define_native("reversed", reversed_native);
+    vm.define_native("getattr", getattr_native);
+    vm.define_native("setattr", setattr_native);
+    vm.define_native("hasattr", hasattr_native);
+    vm.define_native("id", id_native);
+    vm.define_native("hash", hash_native);
+    vm.define_native("issubclass", issubclass_native);
     register_modules(vm);
+}
+
+fn dict_native(vm: &mut Vm, args: &[Value]) -> R {
+    check_args("dict", args, 0, 1)?;
+    let mut d = Dict::default();
+    if let Some(&a) = args.first() {
+        for (k, v) in dict_pairs(vm, a, "dict()")? {
+            d.insert(to_key(k)?, k, v);
+        }
+    }
+    for (k, v) in vm.take_all_kw() {
+        let key = vm.heap.string(vm.syms.name(k).to_string());
+        d.insert(to_key(key)?, key, v);
+    }
+    Ok(vm.heap.dict(d))
+}
+
+fn divmod_native(vm: &mut Vm, args: &[Value]) -> R {
+    check_args("divmod", args, 2, 2)?;
+    let q = vm.binop(BinOp::FloorDiv, args[0], args[1])?;
+    let r = vm.binop(BinOp::Mod, args[0], args[1])?;
+    Ok(vm.heap.tuple(vec![q, r]))
+}
+
+fn pow_native(vm: &mut Vm, args: &[Value]) -> R {
+    check_args("pow", args, 2, 3)?;
+    match args.get(2) {
+        None | Some(Value::None) => vm.binop(BinOp::Pow, args[0], args[1]),
+        Some(&m) => {
+            let (b, e, m) = (want_int(args[0], "pow() base")?, want_int(args[1], "pow() exponent")?, want_int(m, "pow() modulus")?);
+            if m == 0 {
+                return Err("ValueError: pow() 3rd argument cannot be 0".into());
+            }
+            if e < 0 {
+                return Err("ValueError: pow() negative exponent with a modulus isn't supported".into());
+            }
+            let (mut result, mut base, mut e, m) = (1i128, (b as i128).rem_euclid(m as i128), e, m as i128);
+            while e > 0 {
+                if e & 1 == 1 {
+                    result = result * base % m;
+                }
+                base = base * base % m;
+                e >>= 1;
+            }
+            // Python: the result has the sign of the modulus
+            let r = result.rem_euclid(m.abs());
+            Ok(Value::Int(if m < 0 && r != 0 { (r + m) as i64 } else { r as i64 }))
+        }
+    }
+}
+
+fn radix_text(args: &[Value], name: &str, prefix: &str, radix: u32) -> Result<String, String> {
+    check_args(name, args, 1, 1)?;
+    let n = want_int(args[0], &format!("{}() argument", name))?;
+    let mag = n.unsigned_abs();
+    let digits = match radix {
+        16 => format!("{:x}", mag),
+        8 => format!("{:o}", mag),
+        _ => format!("{:b}", mag),
+    };
+    Ok(format!("{}{}{}", if n < 0 { "-" } else { "" }, prefix, digits))
+}
+
+fn hex_native(vm: &mut Vm, args: &[Value]) -> R {
+    let s = radix_text(args, "hex", "0x", 16)?;
+    Ok(vm.heap.string(s))
+}
+
+fn oct_native(vm: &mut Vm, args: &[Value]) -> R {
+    let s = radix_text(args, "oct", "0o", 8)?;
+    Ok(vm.heap.string(s))
+}
+
+fn bin_native(vm: &mut Vm, args: &[Value]) -> R {
+    let s = radix_text(args, "bin", "0b", 2)?;
+    Ok(vm.heap.string(s))
+}
+
+fn reversed_native(vm: &mut Vm, args: &[Value]) -> R {
+    check_args("reversed", args, 1, 1)?;
+    let mut items = vm.to_vec(args[0])?;
+    items.reverse();
+    Ok(vm.heap.list(items))
+}
+
+fn attr_name(vm: &mut Vm, v: Value, f: &str) -> Result<u32, String> {
+    let s = v
+        .as_str()
+        .ok_or_else(|| format!("TypeError: {}(): attribute name must be a string, not '{}'", f, v.type_name()))?;
+    Ok(vm.syms.intern(s))
+}
+
+fn getattr_native(vm: &mut Vm, args: &[Value]) -> R {
+    check_args("getattr", args, 2, 3)?;
+    let name = attr_name(vm, args[1], "getattr")?;
+    match vm.get_attr(args[0], name) {
+        Err(e) if e.starts_with("AttributeError") && args.len() == 3 => Ok(args[2]),
+        r => r,
+    }
+}
+
+fn hasattr_native(vm: &mut Vm, args: &[Value]) -> R {
+    check_args("hasattr", args, 2, 2)?;
+    let name = attr_name(vm, args[1], "hasattr")?;
+    match vm.get_attr(args[0], name) {
+        Ok(_) => Ok(Value::Bool(true)),
+        Err(e) if e.starts_with("AttributeError") => Ok(Value::Bool(false)),
+        Err(e) => Err(e),
+    }
+}
+
+fn setattr_native(vm: &mut Vm, args: &[Value]) -> R {
+    check_args("setattr", args, 3, 3)?;
+    let name = attr_name(vm, args[1], "setattr")?;
+    vm.set_attr(args[0], name, args[2])?;
+    Ok(Value::None)
+}
+
+fn id_native(_: &mut Vm, args: &[Value]) -> R {
+    check_args("id", args, 1, 1)?;
+    Ok(Value::Int(match args[0] {
+        Value::Obj(g) => g.addr() as i64,
+        Value::Int(i) => i,
+        Value::Float(f) => f.to_bits() as i64,
+        Value::Bool(b) => b as i64,
+        _ => 0,
+    }))
+}
+
+fn hash_native(_: &mut Vm, args: &[Value]) -> R {
+    use std::hash::{Hash, Hasher};
+    check_args("hash", args, 1, 1)?;
+    let key = to_key(args[0])?;
+    if let Value::Int(i) = args[0] {
+        return Ok(Value::Int(i));
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut h);
+    Ok(Value::Int(h.finish() as i64))
+}
+
+fn issubclass_native(vm: &mut Vm, args: &[Value]) -> R {
+    check_args("issubclass", args, 2, 2)?;
+    let cls = match args[0] {
+        Value::Obj(g) if matches!(g.get(), Obj::Class(_)) => g,
+        v => return Err(format!("TypeError: issubclass() arg 1 must be a class, not '{}'", v.type_name())),
+    };
+    let targets: Vec<Value> = match args[1] {
+        Value::Obj(g) if matches!(g.get(), Obj::Tuple(_)) => vm.to_vec(args[1])?,
+        v => vec![v],
+    };
+    for t in targets {
+        let t = match t {
+            Value::Obj(g) if matches!(g.get(), Obj::Class(_)) => g,
+            v => return Err(format!("TypeError: issubclass() arg 2 must be a class, not '{}'", v.type_name())),
+        };
+        let mut c = Some(cls);
+        while let Some(k) = c {
+            if k == t {
+                return Ok(Value::Bool(true));
+            }
+            c = k.as_class().parent;
+        }
+    }
+    Ok(Value::Bool(false))
 }
 
 /// Positions in `items` equal to `x` (uses `__eq__` when an instance is involved).
@@ -124,7 +303,7 @@ fn assert_native(vm: &mut Vm, args: &[Value]) -> R {
 
 fn exit_native(vm: &mut Vm, args: &[Value]) -> R {
     check_args("exit", args, 0, 1)?;
-    let _ = vm.out.flush();
+    vm.flush_all();
     let code = match args.first() {
         Some(Value::Int(c)) => *c as i32,
         Some(v) if v.truthy() => {
@@ -197,6 +376,9 @@ fn register_modules(vm: &mut Vm) {
     ];
     let m = fns.iter().map(|&(name, f)| (name, vm.native(name, f))).collect();
     vm.define_module("time", m);
+
+    crate::osmod::register(vm);
+    crate::json::register(vm);
 }
 
 fn want_num(v: Value, what: &str) -> Result<f64, String> {
@@ -440,6 +622,25 @@ fn kw_text(vm: &mut Vm, name: u32, default: &str) -> Result<String, String> {
 fn print(vm: &mut Vm, args: &[Value]) -> R {
     let sep = kw_text(vm, sym::SEP, " ")?;
     let end = kw_text(vm, sym::END, "\n")?;
+    let flush = match vm.take_kw(sym::FLUSH) {
+        Some(v) => vm.truthy(v)?,
+        None => false,
+    };
+    match vm.take_kw(sym::FILE) {
+        None | Some(Value::None) => {}
+        Some(file) => {
+            let mut text = String::new();
+            for (i, a) in args.iter().enumerate() {
+                if i > 0 {
+                    text.push_str(&sep);
+                }
+                text.push_str(&vm.str_of(*a)?);
+            }
+            text.push_str(&end);
+            crate::osmod::print_to(vm, file, &text, flush)?;
+            return Ok(Value::None);
+        }
+    }
     for (i, a) in args.iter().enumerate() {
         if i > 0 {
             let _ = vm.out.write_all(sep.as_bytes());
@@ -458,7 +659,7 @@ fn print(vm: &mut Vm, args: &[Value]) -> R {
         };
     }
     let _ = vm.out.write_all(end.as_bytes());
-    if vm.tty {
+    if vm.tty || flush {
         let _ = vm.out.flush();
     }
     Ok(Value::None)
@@ -471,10 +672,13 @@ fn input(vm: &mut Vm, args: &[Value]) -> R {
     }
     let _ = vm.out.flush();
     let mut line = String::new();
-    io::stdin()
+    let n = io::stdin()
         .lock()
         .read_line(&mut line)
         .map_err(|e| format!("IOError: {}", e))?;
+    if n == 0 {
+        return Err("EOFError: EOF when reading a line".into());
+    }
     while line.ends_with('\n') || line.ends_with('\r') {
         line.pop();
     }
@@ -545,12 +749,53 @@ fn repr(vm: &mut Vm, args: &[Value]) -> R {
     Ok(vm.heap.string(s))
 }
 
+/// `int("ff", 16)`, `int("0x1f", 0)`: Python's rules for an explicit base.
+fn parse_int_base(text: &str, base: i64) -> Result<i64, String> {
+    let bad = || format!("ValueError: invalid literal for int() with base {}: '{}'", base, text);
+    let t = text.trim().replace('_', "");
+    let (neg, mut digits) = match t.strip_prefix('-') {
+        Some(r) => (true, r.to_string()),
+        None => (false, t.strip_prefix('+').unwrap_or(&t).to_string()),
+    };
+    let lower = digits.to_ascii_lowercase();
+    let prefixed = |p: &str| lower.starts_with(p);
+    let mut base = base;
+    if base == 0 {
+        base = if prefixed("0x") { 16 } else if prefixed("0o") { 8 } else if prefixed("0b") { 2 } else { 10 };
+    }
+    if (base == 16 && prefixed("0x")) || (base == 8 && prefixed("0o")) || (base == 2 && prefixed("0b")) {
+        digits = digits[2..].to_string();
+    }
+    if !(2..=36).contains(&base) {
+        return Err("ValueError: int() base must be >= 2 and <= 36, or 0".into());
+    }
+    if digits.is_empty() {
+        return Err(bad());
+    }
+    let mag = u64::from_str_radix(&digits, base as u32).map_err(|_| bad())?;
+    if neg {
+        if mag > i64::MAX as u64 + 1 {
+            return Err(crate::ops::overflow());
+        }
+        Ok((mag as i64).wrapping_neg())
+    } else {
+        i64::try_from(mag).map_err(|_| crate::ops::overflow())
+    }
+}
+
 fn to_int(_: &mut Vm, args: &[Value]) -> R {
-    check_args("int", args, 0, 1)?;
+    check_args("int", args, 0, 2)?;
     let v = match args.first() {
         None => return Ok(Value::Int(0)),
         Some(v) => *v,
     };
+    if let Some(&b) = args.get(1) {
+        let base = want_int(b, "int() base")?;
+        let text = v
+            .as_str()
+            .ok_or("TypeError: int() can't convert non-string with explicit base")?;
+        return parse_int_base(text, base).map(Value::Int);
+    }
     match v {
         Value::Int(i) => Ok(Value::Int(i)),
         Value::Bool(b) => Ok(Value::Int(b as i64)),
@@ -1313,6 +1558,11 @@ pub fn call_method(vm: &mut Vm, recv: Value, name: u32, args: &[Value]) -> R {
             Obj::Dict(_) => dict_method(vm, g, name, args),
             Obj::Set(_) => set_method(vm, g, name, args),
             Obj::Tuple(t) => tuple_method(vm, t, name, args),
+            Obj::Handle(h) => {
+                let method = h.ty.method;
+                let n = vm.syms.name(name).to_string();
+                method(vm, g, &n, args)
+            }
             _ => None,
         };
         if let Some(r) = r {
@@ -1442,6 +1692,244 @@ fn char_index(s: &str, byte: usize) -> i64 {
     s[..byte].chars().count() as i64
 }
 
+/// Byte offset of character `idx` (clamped to the end).
+fn byte_of_char(s: &str, idx: usize) -> usize {
+    s.char_indices().nth(idx).map_or(s.len(), |(b, _)| b)
+}
+
+/// `str.split` / `str.rsplit` with Python's rules (sep None = runs of whitespace).
+fn split_str(s: &str, sep: Option<&str>, maxsplit: i64, rev: bool) -> Vec<String> {
+    match sep {
+        Some(sep) => {
+            if maxsplit < 0 {
+                s.split(sep).map(String::from).collect()
+            } else if rev {
+                let mut v: Vec<String> = s.rsplitn(maxsplit as usize + 1, sep).map(String::from).collect();
+                v.reverse();
+                v
+            } else {
+                s.splitn(maxsplit as usize + 1, sep).map(String::from).collect()
+            }
+        }
+        None => {
+            if maxsplit < 0 {
+                return s.split_whitespace().map(String::from).collect();
+            }
+            let mut out = Vec::new();
+            if !rev {
+                let mut rest = s.trim_start();
+                while !rest.is_empty() {
+                    if out.len() as i64 == maxsplit {
+                        out.push(rest.to_string());
+                        break;
+                    }
+                    match rest.find(char::is_whitespace) {
+                        Some(p) => {
+                            out.push(rest[..p].to_string());
+                            rest = rest[p..].trim_start();
+                        }
+                        None => {
+                            out.push(rest.to_string());
+                            break;
+                        }
+                    }
+                }
+            } else {
+                let mut rest = s.trim_end();
+                while !rest.is_empty() {
+                    if out.len() as i64 == maxsplit {
+                        out.push(rest.to_string());
+                        break;
+                    }
+                    match rest.rfind(char::is_whitespace) {
+                        Some(p) => {
+                            let w = rest[p..].chars().next().map_or(1, char::len_utf8);
+                            out.push(rest[p + w..].to_string());
+                            rest = rest[..p].trim_end();
+                        }
+                        None => {
+                            out.push(rest.to_string());
+                            break;
+                        }
+                    }
+                }
+                out.reverse();
+            }
+            out
+        }
+    }
+}
+
+fn title_case(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_cased = false;
+    for ch in s.chars() {
+        if prev_cased {
+            out.extend(ch.to_lowercase());
+        } else {
+            out.extend(ch.to_uppercase());
+        }
+        prev_cased = ch.is_uppercase() || ch.is_lowercase();
+    }
+    out
+}
+
+/// `find` / `rfind` within s[start:end] (character indices, Python slice rules).
+fn find_in(s: &str, sub: &str, start: Option<i64>, end: Option<i64>, rev: bool) -> Option<i64> {
+    let n = s.chars().count() as i64;
+    let norm = |i: i64| if i < 0 { (i + n).max(0) } else { i.min(n) };
+    let a = norm(start.unwrap_or(0));
+    let b = norm(end.unwrap_or(n));
+    if a > b {
+        return None;
+    }
+    let (ba, bb) = (byte_of_char(s, a as usize), byte_of_char(s, b as usize));
+    let hay = &s[ba..bb];
+    let p = if rev { hay.rfind(sub) } else { hay.find(sub) }?;
+    Some(a + char_index(hay, p))
+}
+
+/// `template.format(*args, **kwargs)`.
+fn str_format(vm: &mut Vm, fmt: &str, args: &[Value]) -> Result<String, String> {
+    let kws = vm.take_all_kw();
+    let mut auto = 0usize;
+    format_template(vm, fmt, args, &kws, &mut auto, 0)
+}
+
+fn format_template(
+    vm: &mut Vm,
+    fmt: &str,
+    args: &[Value],
+    kws: &[(u32, Value)],
+    auto: &mut usize,
+    depth: usize,
+) -> Result<String, String> {
+    let chars: Vec<char> = fmt.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch == '{' {
+            if chars.get(i + 1) == Some(&'{') {
+                out.push('{');
+                i += 2;
+                continue;
+            }
+            let mut level = 1;
+            let mut j = i + 1;
+            while j < chars.len() {
+                match chars[j] {
+                    '{' => level += 1,
+                    '}' => {
+                        level -= 1;
+                        if level == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            if j >= chars.len() {
+                return Err("ValueError: Single '{' encountered in format string".into());
+            }
+            let field: String = chars[i + 1..j].iter().collect();
+            i = j + 1;
+            // field_name[!conversion][:spec]
+            let (head, spec) = match field.find(':') {
+                Some(p) => (&field[..p], &field[p + 1..]),
+                None => (&field[..], ""),
+            };
+            let (fname, conv) = match head.find('!') {
+                Some(p) => (&head[..p], Some(&head[p + 1..])),
+                None => (head, None),
+            };
+            let v = format_field(vm, fname, args, kws, auto)?;
+            let spec = if spec.contains('{') && depth < 2 {
+                format_template(vm, spec, args, kws, auto, depth + 1)?
+            } else {
+                spec.to_string()
+            };
+            let text = match conv {
+                None => None,
+                Some("r") | Some("a") => Some(vm.repr_of(v)?),
+                Some("s") => Some(vm.str_of(v)?),
+                Some(other) => return Err(format!("ValueError: Unknown conversion specifier {}", other)),
+            };
+            if spec.is_empty() {
+                match text {
+                    Some(t) => out.push_str(&t),
+                    None => out.push_str(&vm.str_of(v)?),
+                }
+            } else {
+                let target = match text {
+                    Some(t) => vm.heap.string(t),
+                    None if matches!(v, Value::Int(_) | Value::Float(_) | Value::Bool(_)) || v.as_str().is_some() => v,
+                    None => {
+                        let t = vm.str_of(v)?;
+                        vm.heap.string(t)
+                    }
+                };
+                out.push_str(&apply_format_spec(target, &spec)?);
+            }
+        } else if ch == '}' {
+            if chars.get(i + 1) == Some(&'}') {
+                out.push('}');
+                i += 2;
+                continue;
+            }
+            return Err("ValueError: Single '}' encountered in format string".into());
+        } else {
+            out.push(ch);
+            i += 1;
+        }
+    }
+    Ok(out)
+}
+
+/// Looks up `0`, `name`, `name.attr`, `name[key]` (or an automatic index for "").
+fn format_field(vm: &mut Vm, field: &str, args: &[Value], kws: &[(u32, Value)], auto: &mut usize) -> R {
+    let end = field.find(['.', '[']).unwrap_or(field.len());
+    let (first, mut rest) = (&field[..end], &field[end..]);
+    let mut v = if first.is_empty() {
+        let i = *auto;
+        *auto += 1;
+        *args.get(i).ok_or_else(|| {
+            format!("IndexError: Replacement index {} out of range for positional args tuple", i)
+        })?
+    } else if first.chars().all(|c| c.is_ascii_digit()) {
+        let i: usize = first.parse().unwrap_or(usize::MAX);
+        *args.get(i).ok_or_else(|| {
+            format!("IndexError: Replacement index {} out of range for positional args tuple", i)
+        })?
+    } else {
+        kws.iter()
+            .find(|(k, _)| vm.syms.name(*k) == first)
+            .map(|(_, v)| *v)
+            .ok_or_else(|| format!("KeyError: '{}'", first))?
+    };
+    while !rest.is_empty() {
+        if let Some(r) = rest.strip_prefix('.') {
+            let e = r.find(['.', '[']).unwrap_or(r.len());
+            let name = vm.syms.intern(&r[..e]);
+            v = vm.get_attr(v, name)?;
+            rest = &r[e..];
+        } else if let Some(r) = rest.strip_prefix('[') {
+            let e = r.find(']').ok_or("ValueError: Missing ']' in format string")?;
+            let key_text = &r[..e];
+            let key = match key_text.parse::<i64>() {
+                Ok(n) => Value::Int(n),
+                Err(_) => vm.heap.string(key_text),
+            };
+            v = ops::get_index(&mut vm.heap, v, key)?;
+            rest = &r[e + 1..];
+        } else {
+            return Err(format!("ValueError: invalid format field '{}'", field));
+        }
+    }
+    Ok(v)
+}
+
 fn str_method(vm: &mut Vm, s: &str, name: u32, args: &[Value]) -> Option<R> {
     let syms: *const Interner = &vm.syms;
     let mname = move || unsafe { (*syms).name(name).to_string() };
@@ -1476,20 +1964,265 @@ fn str_method(vm: &mut Vm, s: &str, name: u32, args: &[Value]) -> Option<R> {
                 };
                 Ok(vm.heap.string(r))
             }
-            sym::SPLIT => {
-                c(0, 1)?;
-                let parts: Vec<String> = match args.first() {
-                    None | Some(Value::None) => s.split_whitespace().map(String::from).collect(),
-                    Some(sep) => {
-                        let sep = want_str(*sep, "separator")?;
+            sym::SPLIT | sym::RSPLIT => {
+                c(0, 2)?;
+                let sep = vm.take_kw(sym::SEP).or(args.first().copied()).unwrap_or(Value::None);
+                let maxsplit = match vm.take_kw(sym::MAXSPLIT).or(args.get(1).copied()) {
+                    None => -1,
+                    Some(v) => want_int(v, "maxsplit")?,
+                };
+                let sep = match sep {
+                    Value::None => None,
+                    v => {
+                        let sep = want_str(v, "separator")?;
                         if sep.is_empty() {
                             return Err("ValueError: empty separator".into());
                         }
-                        s.split(sep).map(String::from).collect()
+                        Some(sep)
                     }
                 };
+                let parts = split_str(s, sep, maxsplit, name == sym::RSPLIT);
                 let vals = parts.into_iter().map(|p| vm.heap.string(p)).collect();
                 Ok(vm.heap.list(vals))
+            }
+            sym::TITLE => {
+                c(0, 0)?;
+                Ok(vm.heap.string(title_case(s)))
+            }
+            sym::CAPITALIZE => {
+                c(0, 0)?;
+                let mut cs = s.chars();
+                let r = match cs.next() {
+                    Some(f) => f.to_uppercase().collect::<String>() + &cs.as_str().to_lowercase(),
+                    None => String::new(),
+                };
+                Ok(vm.heap.string(r))
+            }
+            sym::SWAPCASE => {
+                c(0, 0)?;
+                let r: String = s
+                    .chars()
+                    .flat_map(|ch| -> Vec<char> {
+                        if ch.is_uppercase() {
+                            ch.to_lowercase().collect()
+                        } else if ch.is_lowercase() {
+                            ch.to_uppercase().collect()
+                        } else {
+                            vec![ch]
+                        }
+                    })
+                    .collect();
+                Ok(vm.heap.string(r))
+            }
+            sym::CASEFOLD => {
+                c(0, 0)?;
+                Ok(vm.heap.string(s.to_lowercase()))
+            }
+            sym::ZFILL => {
+                c(1, 1)?;
+                let width = want_int(args[0], "width")?;
+                let n = s.chars().count() as i64;
+                if n >= width {
+                    return Ok(vm.heap.string(s));
+                }
+                let zeros = "0".repeat((width - n) as usize);
+                let r = match s.chars().next() {
+                    Some(sign @ ('+' | '-')) => format!("{}{}{}", sign, zeros, &s[1..]),
+                    _ => format!("{}{}", zeros, s),
+                };
+                Ok(vm.heap.string(r))
+            }
+            sym::CENTER | sym::LJUST | sym::RJUST => {
+                c(1, 2)?;
+                let width = want_int(args[0], "width")?;
+                let fill = match args.get(1) {
+                    None => ' ',
+                    Some(f) => {
+                        let f = want_str(*f, "fill character")?;
+                        let mut it = f.chars();
+                        match (it.next(), it.next()) {
+                            (Some(ch), None) => ch,
+                            _ => return Err("TypeError: the fill character must be exactly one character long".into()),
+                        }
+                    }
+                };
+                let n = s.chars().count() as i64;
+                if n >= width {
+                    return Ok(vm.heap.string(s));
+                }
+                let marg = width - n;
+                let (left, right) = match name {
+                    sym::LJUST => (0, marg),
+                    sym::RJUST => (marg, 0),
+                    // CPython's rule for where the odd padding character goes
+                    _ => {
+                        let left = marg / 2 + (marg & width & 1);
+                        (left, marg - left)
+                    }
+                };
+                let f = |k: i64| fill.to_string().repeat(k as usize);
+                Ok(vm.heap.string(format!("{}{}{}", f(left), s, f(right))))
+            }
+            sym::SPLITLINES => {
+                c(0, 1)?;
+                let keep = match vm.take_kw(sym::KEEPENDS).or(args.first().copied()) {
+                    Some(v) => vm.truthy(v)?,
+                    None => false,
+                };
+                let mut lines = Vec::new();
+                let mut start = 0;
+                let b = s.as_bytes();
+                let mut i = 0;
+                while i < b.len() {
+                    let (is_break, len) = match b[i] {
+                        b'\n' => (true, 1),
+                        b'\r' => (true, if b.get(i + 1) == Some(&b'\n') { 2 } else { 1 }),
+                        _ => (false, 1),
+                    };
+                    if is_break {
+                        lines.push(&s[start..if keep { i + len } else { i }]);
+                        start = i + len;
+                    }
+                    i += len;
+                }
+                if start < s.len() {
+                    lines.push(&s[start..]);
+                }
+                let vals = lines.into_iter().map(|l| vm.heap.string(l)).collect();
+                Ok(vm.heap.list(vals))
+            }
+            sym::PARTITION | sym::RPARTITION => {
+                c(1, 1)?;
+                let sep = want_str(args[0], "separator")?;
+                if sep.is_empty() {
+                    return Err("ValueError: empty separator".into());
+                }
+                let found = if name == sym::PARTITION { s.find(sep) } else { s.rfind(sep) };
+                let (a, m, b) = match found {
+                    Some(i) => (&s[..i], sep, &s[i + sep.len()..]),
+                    None if name == sym::PARTITION => (s, "", ""),
+                    None => ("", "", s),
+                };
+                let parts = vec![vm.heap.string(a), vm.heap.string(m), vm.heap.string(b)];
+                Ok(vm.heap.tuple(parts))
+            }
+            sym::FIND | sym::RFIND | sym::INDEX | sym::RINDEX => {
+                c(1, 3)?;
+                let sub = want_str(args[0], "substring")?;
+                let rev = name == sym::RFIND || name == sym::RINDEX;
+                let start = match args.get(1) {
+                    None | Some(Value::None) => None,
+                    Some(v) => Some(want_int(*v, "start")?),
+                };
+                let end = match args.get(2) {
+                    None | Some(Value::None) => None,
+                    Some(v) => Some(want_int(*v, "end")?),
+                };
+                match find_in(s, sub, start, end, rev) {
+                    Some(i) => Ok(Value::Int(i)),
+                    None if name == sym::FIND || name == sym::RFIND => Ok(Value::Int(-1)),
+                    None => Err("ValueError: substring not found".into()),
+                }
+            }
+            sym::REMOVEPREFIX => {
+                c(1, 1)?;
+                let p = want_str(args[0], "prefix")?;
+                Ok(vm.heap.string(s.strip_prefix(p).unwrap_or(s)))
+            }
+            sym::REMOVESUFFIX => {
+                c(1, 1)?;
+                let p = want_str(args[0], "suffix")?;
+                Ok(vm.heap.string(s.strip_suffix(p).unwrap_or(s)))
+            }
+            sym::ISUPPER => {
+                c(0, 0)?;
+                let cased = s.chars().any(|ch| ch.is_uppercase() || ch.is_lowercase());
+                Ok(Value::Bool(cased && !s.chars().any(char::is_lowercase)))
+            }
+            sym::ISLOWER => {
+                c(0, 0)?;
+                let cased = s.chars().any(|ch| ch.is_uppercase() || ch.is_lowercase());
+                Ok(Value::Bool(cased && !s.chars().any(char::is_uppercase)))
+            }
+            sym::ISALNUM => {
+                c(0, 0)?;
+                Ok(Value::Bool(!s.is_empty() && s.chars().all(char::is_alphanumeric)))
+            }
+            sym::ISNUMERIC => {
+                c(0, 0)?;
+                Ok(Value::Bool(!s.is_empty() && s.chars().all(char::is_numeric)))
+            }
+            sym::ISDECIMAL => {
+                c(0, 0)?;
+                Ok(Value::Bool(!s.is_empty() && s.chars().all(|ch| ch.is_ascii_digit())))
+            }
+            sym::ISASCII => {
+                c(0, 0)?;
+                Ok(Value::Bool(s.is_ascii()))
+            }
+            sym::ISTITLE => {
+                c(0, 0)?;
+                let (mut cased, mut prev_cased) = (false, false);
+                for ch in s.chars() {
+                    if ch.is_uppercase() {
+                        if prev_cased {
+                            return Ok(Value::Bool(false));
+                        }
+                        prev_cased = true;
+                        cased = true;
+                    } else if ch.is_lowercase() {
+                        if !prev_cased {
+                            return Ok(Value::Bool(false));
+                        }
+                        prev_cased = true;
+                        cased = true;
+                    } else {
+                        prev_cased = false;
+                    }
+                }
+                Ok(Value::Bool(cased))
+            }
+            sym::ISIDENTIFIER => {
+                c(0, 0)?;
+                let mut it = s.chars();
+                let ok = match it.next() {
+                    Some(f) => (f.is_alphabetic() || f == '_') && it.all(|ch| ch.is_alphanumeric() || ch == '_'),
+                    None => false,
+                };
+                Ok(Value::Bool(ok))
+            }
+            sym::EXPANDTABS => {
+                c(0, 1)?;
+                let size = match args.first() {
+                    Some(v) => want_int(*v, "tabsize")?.max(0) as usize,
+                    None => 8,
+                };
+                let mut out = String::new();
+                let mut col = 0;
+                for ch in s.chars() {
+                    match ch {
+                        '\t' => {
+                            if size > 0 {
+                                let n = size - col % size;
+                                out.push_str(&" ".repeat(n));
+                                col += n;
+                            }
+                        }
+                        '\n' | '\r' => {
+                            out.push(ch);
+                            col = 0;
+                        }
+                        _ => {
+                            out.push(ch);
+                            col += 1;
+                        }
+                    }
+                }
+                Ok(vm.heap.string(out))
+            }
+            sym::FORMAT => {
+                let out = str_format(vm, s, args)?;
+                Ok(vm.heap.string(out))
             }
             sym::JOIN => {
                 c(1, 1)?;
@@ -1518,18 +2251,25 @@ fn str_method(vm: &mut Vm, s: &str, name: u32, args: &[Value]) -> Option<R> {
                 let to = want_str(args[1], "new")?;
                 Ok(vm.heap.string(s.replace(from, to)))
             }
-            sym::STARTSWITH => {
+            sym::STARTSWITH | sym::ENDSWITH => {
                 c(1, 1)?;
-                Ok(Value::Bool(s.starts_with(want_str(args[0], "prefix")?)))
-            }
-            sym::ENDSWITH => {
-                c(1, 1)?;
-                Ok(Value::Bool(s.ends_with(want_str(args[0], "suffix")?)))
-            }
-            sym::FIND => {
-                c(1, 1)?;
-                let sub = want_str(args[0], "substring")?;
-                Ok(Value::Int(s.find(sub).map_or(-1, |b| char_index(s, b))))
+                let what = if name == sym::STARTSWITH { "prefix" } else { "suffix" };
+                // a single string or a tuple of them
+                let options: Vec<Value> = match args[0] {
+                    Value::Obj(g) if matches!(g.get(), Obj::Tuple(_)) => match g.get() {
+                        Obj::Tuple(t) => t.to_vec(),
+                        _ => unreachable!(),
+                    },
+                    v => vec![v],
+                };
+                for o in options {
+                    let p = want_str(o, what)?;
+                    let hit = if name == sym::STARTSWITH { s.starts_with(p) } else { s.ends_with(p) };
+                    if hit {
+                        return Ok(Value::Bool(true));
+                    }
+                }
+                Ok(Value::Bool(false))
             }
             sym::COUNT => {
                 c(1, 1)?;
@@ -1557,6 +2297,42 @@ fn str_method(vm: &mut Vm, s: &str, name: u32, args: &[Value]) -> Option<R> {
             )),
         }
     })())
+}
+
+/// Key/value pairs from a dict or an iterable of 2-item sequences.
+fn dict_pairs(vm: &mut Vm, v: Value, what: &str) -> Result<Vec<(Value, Value)>, String> {
+    if let Value::Obj(o) = v {
+        if let Obj::Dict(d) = o.get() {
+            return Ok(d.entries.clone());
+        }
+    }
+    let (mark, items) = rooted_items(vm, v)
+        .map_err(|_| format!("TypeError: {} needs a dict or pairs, not '{}'", what, v.type_name()))?;
+    let mut out = Vec::with_capacity(items.len());
+    let mut err = None;
+    for (i, it) in items.into_iter().enumerate() {
+        match vm.to_vec(it) {
+            Ok(kv) if kv.len() == 2 => out.push((kv[0], kv[1])),
+            Ok(kv) => {
+                err = Some(format!(
+                    "ValueError: {} sequence element #{} has length {}; 2 is required",
+                    what,
+                    i,
+                    kv.len()
+                ));
+                break;
+            }
+            Err(e) => {
+                err = Some(e);
+                break;
+            }
+        }
+    }
+    vm.temp_reset(mark);
+    match err {
+        Some(e) => Err(e),
+        None => Ok(out),
+    }
 }
 
 fn dict_mut<'a>(g: Gc) -> &'a mut Dict {
@@ -1605,24 +2381,44 @@ fn dict_method(vm: &mut Vm, g: Gc, name: u32, args: &[Value]) -> Option<R> {
                 }
             }
             sym::UPDATE => {
-                c(1, 1)?;
-                let other = match args[0] {
-                    Value::Obj(o) => match o.get() {
-                        Obj::Dict(d) => d.entries.clone(),
-                        _ => Vec::new(),
-                    },
-                    _ => {
-                        return Err(format!(
-                            "TypeError: dict.update() needs a dict, not '{}'",
-                            args[0].type_name()
-                        ))
-                    }
+                c(0, 1)?;
+                let mut pairs = match args.first() {
+                    None => Vec::new(),
+                    Some(&a) => dict_pairs(vm, a, "dict.update()")?,
                 };
+                for (k, v) in vm.take_all_kw() {
+                    let key = vm.heap.string(vm.syms.name(k).to_string());
+                    pairs.push((key, v));
+                }
                 let me = dict_mut(g);
-                for (k, v) in other {
+                for (k, v) in pairs {
                     me.insert(to_key(k)?, k, v);
                 }
                 Ok(Value::None)
+            }
+            sym::SETDEFAULT => {
+                c(1, 2)?;
+                let key = to_key(args[0])?;
+                let d = dict_mut(g);
+                match d.get(&key) {
+                    Some(v) => Ok(v),
+                    None => {
+                        let v = args.get(1).copied().unwrap_or(Value::None);
+                        d.insert(key, args[0], v);
+                        Ok(v)
+                    }
+                }
+            }
+            sym::POPITEM => {
+                c(0, 0)?;
+                let last = dict_mut(g).entries.last().copied();
+                match last {
+                    Some((k, v)) => {
+                        dict_mut(g).remove(&to_key(k)?);
+                        Ok(vm.heap.tuple(vec![k, v]))
+                    }
+                    None => Err("KeyError: 'popitem(): dictionary is empty'".into()),
+                }
             }
             sym::CLEAR => {
                 c(0, 0)?;

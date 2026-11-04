@@ -1,0 +1,4 @@
+# Test expectations are compared byte for byte: keep them LF on every OS.
+*.out text eol=lf
+*.err text eol=lf
+*.fst text eol=lf

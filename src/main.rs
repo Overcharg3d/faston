@@ -2,9 +2,12 @@ mod builtins;
 mod bundle;
 mod bytecode;
 mod compiler;
+mod fileio;
 mod fx;
+mod json;
 mod lexer;
 mod ops;
+mod osmod;
 mod value;
 mod vm;
 
@@ -45,6 +48,7 @@ fn real_main() -> i32 {
         // a built executable: run the bundled program as native code
         let mut vm = Vm::compiled();
         vm.bundle = Some(b.modules);
+        vm.set_argv(env::args().collect());
         return report(vm.run_file(&b.main_name, &b.main_src));
     }
     let args: Vec<String> = env::args().collect();
@@ -70,19 +74,21 @@ fn real_main() -> i32 {
         Some("run") => {
             let mut native = native_env;
             let mut path = None;
+            let mut rest = Vec::new();
+            // options come before the file; everything after it goes to the program
             for a in &args[2..] {
-                match a.as_str() {
-                    "--native" | "-n" => native = true,
-                    "--interp" | "-i" => native = false,
-                    p if path.is_none() => path = Some(p.to_string()),
-                    _ => {}
+                match (a.as_str(), &path) {
+                    ("--native" | "-n", None) => native = true,
+                    ("--interp" | "-i", None) => native = false,
+                    (p, None) => path = Some(p.to_string()),
+                    (p, Some(_)) => rest.push(p.to_string()),
                 }
             }
             let path = path.unwrap_or_else(|| {
                 eprintln!("faston: run needs a file");
                 process::exit(2);
             });
-            return run(&path, native);
+            return run(&path, native, rest);
         }
         Some("build") => {
             let mut out = None;
@@ -101,14 +107,17 @@ fn real_main() -> i32 {
             });
             return bundle::build(&path, out.as_deref());
         }
-        Some(path) => return run(path, native_env),
+        Some(path) => return run(path, native_env, args[2..].to_vec()),
     }
     0
 }
 
-fn run(path: &str, native: bool) -> i32 {
+fn run(path: &str, native: bool, program_args: Vec<String>) -> i32 {
     let src = read_file(path);
     let mut vm = if native { Vm::compiled() } else { Vm::new() };
+    let mut argv = vec![path.to_string()];
+    argv.extend(program_args);
+    vm.set_argv(argv);
     report(vm.run_file(path, &src))
 }
 
