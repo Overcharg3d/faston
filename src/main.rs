@@ -4,6 +4,8 @@ mod bytecode;
 mod compiler;
 mod fileio;
 mod fx;
+#[cfg(feature = "gui")]
+mod gui;
 mod json;
 mod lexer;
 mod ops;

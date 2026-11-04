@@ -217,6 +217,72 @@
     ],
     "description": "Fixed-structure update loop with a delta time"
   },
+  "with open": {
+    "prefix": "with",
+    "body": ["with (open(${1:\"file.txt\"}${2:, \"r\"}) as ${3:f}) {", "\t${0:let text = $3.read();}", "}"],
+    "description": "with statement (closes the file automatically)"
+  },
+  "property": {
+    "prefix": "prop",
+    "body": [
+      "@property",
+      "def ${1:name}(self) {",
+      "\treturn self._$1;",
+      "}",
+      "@$1.setter",
+      "def $1(self, value) {",
+      "\tself._$1 = value;",
+      "}"
+    ],
+    "description": "Property with a getter and a setter"
+  },
+  "generator": {
+    "prefix": "gen",
+    "body": ["def ${1:items}(${2:n}) {", "\tfor (${3:i} in range($2)) {", "\t\tyield ${0:$3};", "\t}", "}"],
+    "description": "Generator function"
+  },
+  "gui app": {
+    "prefix": "guiapp",
+    "body": [
+      "import gui;",
+      "",
+      "let ${1:count} = 0;",
+      "",
+      "def draw(ui) {",
+      "\tglobal $1;",
+      "\tui.heading(\"${2:My app}\");",
+      "\tif (ui.button(\"Click me\")) { $1 += 1; }",
+      "\tui.label(f\"clicked {$1} times\");",
+      "\t$0",
+      "}",
+      "",
+      "gui.run(draw, title=\"$2\", width=640, height=480);"
+    ],
+    "description": "A gui app skeleton"
+  },
+  "gui game": {
+    "prefix": "guigame",
+    "body": [
+      "import gui;",
+      "",
+      "let x, y = 100, 100;",
+      "",
+      "def draw(ui) {",
+      "\tglobal x, y;",
+      "\tlet speed = 200 * ui.dt();",
+      "\tif (ui.key_down(\"left\")) { x -= speed; }",
+      "\tif (ui.key_down(\"right\")) { x += speed; }",
+      "\tif (ui.key_down(\"up\")) { y -= speed; }",
+      "\tif (ui.key_down(\"down\")) { y += speed; }",
+      "\tlet c = ui.canvas(background=\"#101820\");",
+      "\tc.circle(x, y, 20, \"orange\");",
+      "\t$0",
+      "}",
+      "",
+      "gui.run(draw, title=\"${1:Game}\", width=800, height=600, animate=True);"
+    ],
+    "description": "A canvas game skeleton with arrow-key movement"
+  },
   "region": {
     "prefix": "region",
     "body": ["# region ${1:name}", "${0}", "# endregion"],

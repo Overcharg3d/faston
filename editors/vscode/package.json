@@ -2,7 +2,7 @@
   "name": "faston",
   "displayName": "Faston",
   "description": "Language support for Faston (.fst): highlighting, live compiler errors, IntelliSense, go to definition, rename, formatting, run / build / REPL.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "overcharg3d",
   "repository": {
     "type": "git",

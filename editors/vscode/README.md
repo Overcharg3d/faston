@@ -11,14 +11,15 @@ recognized automatically.
   plus semantic highlighting (classes, functions, parameters, constants,
   modules)
 - Completion for names in scope, `self.` members, class instances, modules
-  (`math.`, `random.`, `time.`, and your own `.fst` modules), and methods of
-  str/list/dict/set/tuple. Unimported modules can be completed too; the
+  (`math`, `random`, `time`, `os`, `os.path`, `sys`, `json`, `shutil`, `gui`,
+  and your own `.fst` modules), files (`with (open(p) as f)`), and methods of
+  str/list/dict/set/tuple and of the gui `ui` and canvas objects. Unimported modules can be completed too; the
   `import` line is added for you.
 - Hover docs for everything, including every built-in function, method and
   module, plus inferred types (`p: Player`, `words: list`)
 - Signature help while typing arguments, including keyword arguments
-- Snippets: `def`, `class`, `init`, `forr`, `fork`, `try`, `lambda`, `main`,
-  `gameloop`, and more
+- Snippets: `def`, `class`, `init`, `forr`, `fork`, `try`, `with`, `prop`,
+  `gen`, `lambda`, `main`, `guiapp`, `guigame`, and more
 - Auto-indent, bracket matching and auto-closing, comment toggling
   (`Ctrl+/`), folding (blocks, comment blocks, `# region`)
 
@@ -35,8 +36,7 @@ recognized automatically.
 - Editor checks that the compiler can't do before run time:
   - undefined names, with "did you mean `True`?" and add-import fixes
   - missing modules or imported names
-  - Python habits: `__init__` (rename to `init`) and `super()` (replace with
-    `Base.init(self, ...)`)
+  - the Python habit `__init__` (quick fix renames it to `init`)
 - Runtime tracebacks from **Run** are linked back to the source line
 
 **Running**
@@ -93,5 +93,5 @@ If you have the Faston source open, **Faston: Build the Faston Compiler** runs
 ```sh
 cd editors/vscode
 npx @vscode/vsce package
-code --install-extension faston-0.1.0.vsix
+code --install-extension faston-0.2.0.vsix
 ```

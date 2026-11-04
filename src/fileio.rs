@@ -233,7 +233,7 @@ fn read_line(s: &mut Stream) -> Result<Vec<u8>, String> {
 /// Reads up to `n` characters (not bytes).
 fn read_chars(s: &mut Stream, n: usize) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
-    let mut byte = |s: &mut Stream| -> Result<Option<u8>, String> {
+    let byte = |s: &mut Stream| -> Result<Option<u8>, String> {
         let mut b = [0u8; 1];
         let r = match s {
             Stream::Reader(r) => r.read(&mut b),

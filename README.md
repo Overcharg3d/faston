@@ -29,9 +29,30 @@ for (i in range(3)) {
 print(f"sqrt(2) = {math.sqrt(2):.4f}");
 ```
 
+It also has what real programs need: files, `os` / `sys` / `json` / `shutil`
+modules, generators, `with`, decorators, properties, and a built-in `gui`
+module for desktop apps and games:
+
+```faston
+import gui;
+
+let clicks = 0;
+def draw(ui) {
+    global clicks;
+    ui.heading("Hello from Faston");
+    if (ui.button("Click me")) { clicks += 1; }
+    ui.label(f"clicked {clicks} times");
+    let c = ui.canvas(300, 100, background="#101820");
+    c.circle(50 + clicks * 10, 50, 20, "orange");
+}
+gui.run(draw, title="Demo", width=400, height=260);
+```
+
 ## Build and run
 
-Requires a recent stable Rust toolchain (`rustup`).
+Requires a recent stable Rust toolchain (`rustup`). The `gui` module is
+included by default; `cargo build --release --no-default-features` builds a
+smaller `faston` without it.
 
 ```sh
 cargo build --release
@@ -109,7 +130,8 @@ changes are:
 | `def f(a, b=1):`          | `def f(a, b = 1) { }`           |
 | `class B(A):`             | `class B(A) { def init(self) { } }` |
 | `__init__`                | `init`                          |
-| `super().__init__(x)`     | `A.init(self, x);`              |
+| `super().__init__(x)`     | `super().init(x);`              |
+| `with open(p) as f:`      | `with (open(p) as f) { }`       |
 | statements end at newline | statements end with `;`         |
 
 Indentation is not significant. `&&`, `||`, `!` work as aliases for
@@ -237,27 +259,138 @@ flags and tile masks.
   (like Python), so `def f(hp = MAX_HP, items = [])` works
 - comments start with `#`; hex literals `0xFF`; underscores `1_000_000`
 
-**Built-in functions:** `print input len range str repr int float bool list
-tuple set type isinstance abs min max sum round sorted chr ord format clock exit
-map filter enumerate zip any all callable`
+- `x is None`, `a is not b`; `del name`, `del d[key]`, `del xs[1:3]`,
+  `del obj.attr`; slice assignment `xs[1:3] = [7, 8, 9]`
 
-Keyword arguments of built-ins: `print(sep=, end=)`, `sorted(key=, reverse=)`,
-`list.sort(key=, reverse=)`, `min`/`max(key=, default=)`, `enumerate(start=)`.
-`map`, `filter`, `enumerate` and `zip` return lists rather than lazy iterators.
-`isinstance(x, (A, B))` accepts a tuple of classes.
+**Generators.** A function containing `yield` returns a generator; `for`
+loops, `list()`, `sum()`, `next()`, `in` and friends consume it lazily, so
+infinite generators work. `yield from it;` yields everything from another
+iterable, and `gen.send(v)` resumes it with a value. Classes can implement
+Python's iterator protocol with `__iter__` / `__next__`.
+
+```faston
+def fib() {
+    let a, b = 0, 1;
+    while (True) { yield a; a, b = b, a + b; }
+}
+for (n in fib()) {
+    if (n > 100) { break; }
+    print(n);
+}
+```
+
+**with** calls `__enter__`, runs the block, and always calls `__exit__` (on
+exceptions, `return` and `break` too); several managers can be listed.
+
+```faston
+with (open("scores.json") as f) {
+    let scores = json.load(f);
+}
+```
+
+**Decorators** work on functions and classes. Class bodies can hold methods,
+`@staticmethod`, `@classmethod`, `@property` (with `@name.setter`) and class
+attributes (`count = 0;`), and methods can call `super().method(...)`:
+
+```faston
+class Temperature {
+    unit = "C";
+    def init(self, c) { self._c = c; }
+    @property
+    def celsius(self) { return self._c; }
+    @celsius.setter
+    def celsius(self, v) {
+        if (v < -273.15) { raise ValueError("too cold"); }
+        self._c = v;
+    }
+}
+```
+
+**Built-in functions:** `print input len range str repr int float bool list
+tuple set dict type isinstance issubclass abs min max sum round divmod pow
+sorted reversed chr ord hex oct bin format clock exit map filter enumerate zip
+any all callable iter next getattr setattr hasattr id hash open property
+staticmethod classmethod`
+
+Keyword arguments of built-ins: `print(sep=, end=, file=, flush=)`,
+`sorted(key=, reverse=)`, `list.sort(key=, reverse=)`, `min`/`max(key=,
+default=)`, `enumerate(start=)`, `open(mode=, encoding=)`, `dict(**kw)`,
+`int(text, base)`. `map`, `filter`, `enumerate` and `zip` return lists rather
+than lazy iterators. `isinstance(x, (A, B))` accepts a tuple of classes.
 
 **Methods:**
 - list: `append extend pop insert remove index count clear copy reverse sort`
 - tuple: `count index`
-- str: `upper lower strip lstrip rstrip split join replace startswith endswith
-  find count isdigit isalpha isspace`
-- dict: `keys values items get pop update clear copy`
+- str: `upper lower casefold title capitalize swapcase strip lstrip rstrip split
+  rsplit splitlines partition rpartition join replace startswith endswith find
+  rfind index rindex count removeprefix removesuffix zfill center ljust rjust
+  expandtabs format isdigit isalpha isalnum isspace isupper islower istitle
+  isnumeric isdecimal isidentifier isascii`
+- dict: `keys values items get pop popitem setdefault update clear copy`
+- set: `add remove discard pop clear copy update union intersection difference
+  symmetric_difference issubset issuperset isdisjoint`
+- file: `read readline readlines write writelines seek tell flush close`, plus
+  `name mode closed`; iterating a file gives its lines
+- generator: `send close`
 
-**Modules** (`import math, random, time;`):
+**Files** are UTF-8 text: `open(path, "r" | "w" | "a" | "x" [+ "+"])`.
+Reading turns `"\r\n"` into `"\n"`; writing writes exactly what you give it,
+so programs produce the same files on every OS. Missing files raise
+`FileNotFoundError` (and friends, all subclasses of `OSError`). Files still
+open when the program ends are flushed.
+
+**Modules** (`import math, os, json;`):
 - `math`: `pi e tau inf nan sqrt sin cos tan asin acos atan atan2 exp log
   log10 log2 pow floor ceil trunc hypot degrees radians isnan isinf fabs`
 - `random`: `random randint uniform choice shuffle seed`
 - `time`: `time perf_counter sleep`
+- `os`: `getcwd chdir listdir mkdir makedirs rmdir remove rename replace
+  getenv putenv unsetenv system walk cpu_count getpid environ name sep linesep`
+- `os.path`: `join exists isfile isdir isabs basename dirname split splitext
+  abspath normpath realpath relpath expanduser getsize getmtime`
+- `sys`: `argv exit platform version executable maxsize stdin stdout stderr`
+- `json`: `dumps loads dump load` (`indent=`, `sort_keys=`, `ensure_ascii=`,
+  `separators=`; Python's output format and error messages)
+- `shutil`: `copyfile copy copytree move rmtree which`
+- `gui`: windows, widgets and a drawing canvas (below)
+
+Program arguments follow the file: `faston game.fst --level 3` gives
+`sys.argv == ["game.fst", "--level", "3"]`.
+
+### GUI
+
+`gui.run(draw)` opens a window and calls `draw(ui)` every frame (egui's
+immediate mode: there are no widget objects to keep; each widget returns what
+the user did). Options: `title=`, `width=`, `height=`, `dark=`, `resizable=`,
+`animate=True` (redraw continuously, for games), and `left=` / `right=` /
+`top=` / `bottom=` functions that draw side panels. See
+[examples/gui_demo.fst](examples/gui_demo.fst).
+
+- text: `ui.label(text, size=, color=, bold=, italic=)`, `heading`,
+  `monospace`, `hyperlink(url, text)`, `separator()`, `space(px)`,
+  `image(path, width=, height=)`
+- input: `button(text)` → clicked?, `checkbox(text, value)`, `radio(text,
+  selected)`, `selectable(text, selected)`, `slider(text, value, min, max)`,
+  `drag(text, value, speed=)`, `textbox(text, hint=, password=)`,
+  `textarea(text, rows=)`, `combo(label, options, selected)`, `color(color)`,
+  `progress(fraction)`, `spinner()`; each returns the new value
+- layout (each takes a function that gets a nested `ui`): `horizontal`,
+  `vertical`, `group`, `indent`, `scroll(fn, height=)`, `collapsing(title,
+  fn)`, `columns(n, fn)` (fn gets a list of uis), `window(title, fn)`
+- `ui.canvas(width, height, background=)` → `c.rect(x, y, w, h, color,
+  fill=, radius=)`, `c.circle(x, y, r, color)`, `c.line(...)`,
+  `c.polygon(points, color)`, `c.text(x, y, text, color, size=, align=)`,
+  `c.image(path, x, y)`, `c.clear(color)`, `c.mouse()`, `c.clicked()`,
+  `c.down()`, `c.width`, `c.height`
+- input state: `ui.key_down("left")`, `ui.key_pressed("space")`,
+  `ui.mouse()`, `ui.mouse_down()`, `ui.clicked()`, `ui.dt()`, `ui.time()`,
+  `ui.fps()`; `ui.close()`, `ui.set_dark(bool)`
+- colors: names (`"red"`, `"orange"`, ...), `"#rgb"`, `"#rrggbb"`,
+  `"#rrggbbaa"`, `(r, g, b)` / `(r, g, b, a)`, or `gui.rgb(r, g, b, a)`
+
+Errors raised inside `draw` close the window and come out of `gui.run`. One
+`gui.run` per program (use `ui.window` for more windows). Not yet available
+on macOS (the window needs the main thread there).
 
 **Uncaught exceptions** print a Python-style traceback (from where the
 exception was raised) and exit with status 1:
@@ -272,7 +405,15 @@ TypeError: unsupported operand type(s) for +: 'str' and 'int'
 
 ### Differences from Python (current limitations)
 
-- No generators (`yield`), `with` statements, decorators, or `async`.
+- No `async`, no `match`, no binary files / `bytes` yet.
+- Generator expressions in parentheses are only allowed as call arguments
+  (`sum(x * x for x in xs)`), and are evaluated eagerly.
+- Generator functions run in the interpreter even in native mode (the code
+  that loops over them is still compiled). A closure created inside a
+  generator keeps the values its variables had when the generator last paused.
+- `del` works on globals, items, slices and attributes, not on function locals.
+- A class attribute changed after a subclass was created isn't seen by the
+  subclass (methods and attributes are copied when the subclass is defined).
 - Parameters after `*args` (keyword-only parameters) aren't supported.
 - Integers are 64-bit; overflow raises `OverflowError` instead of growing.
 - `type(x)` returns the type's name as a string (`"int"`, `"Player"`).
@@ -348,6 +489,10 @@ source ─► lexer ─► single-pass compiler ─► bytecode ─┬─► int
   and the call stack is captured only when an exception is actually thrown.
 - **Operator methods** live on the slow paths only: int/float arithmetic and
   comparisons never check for them.
+- **Generators**: calling a generator function packages the new frame into a
+  generator object; `yield` copies the frame's stack slots (and active `try`
+  blocks) into it, and resuming copies them back and continues where it left
+  off.
 
 ## Project layout
 
@@ -362,8 +507,13 @@ src/
   bundle.rs     `faston build`: standalone executables
   value.rs      Value, heap objects, garbage collector, dicts
   ops.rs        operator semantics (Python-compatible)
-  builtins.rs   built-in functions, methods, modules
+  builtins.rs   built-in functions, methods, math/random/time
+  fileio.rs     open(), file objects, standard streams
+  osmod.rs      sys, os, os.path, shutil
+  json.rs       json module
+  gui.rs        gui module (egui): windows, widgets, canvas
   fx.rs         fast hash function
+editors/vscode/ the VS Code extension
 tests/
   cases/*.fst   programs + expected output (.out); `_*.fst` are helper modules
   errors/*.fst  programs that must fail with the message in .err
@@ -371,7 +521,7 @@ tests/
   native.sh     run the tests compiled to native code
   fuzz.py       random programs run in both Faston and CPython
 examples/       tour.fst, life.fst, arena/ (multi-file), physics.fst (operators,
-                exceptions, tuples, keyword arguments)
+                exceptions, tuples, keyword arguments), gui_demo.fst (gui)
 bench/          benchmarks with CPython equivalents
 ```
 
@@ -379,7 +529,8 @@ bench/          benchmarks with CPython equivalents
 
 An embedding API so a game engine (Rust, C, or a Tauri/JS host) can run Faston
 scripts and register its own functions (`Vm::call` and native functions already
-exist internally); generators; `with` statements; decorators; arbitrary-size
-integers. For the native compiler: type feedback (record the types each
+exist internally); a package manager and import search path; `bytes` and
+binary files; `subprocess`, `datetime`, `re`, networking; native file dialogs
+for the gui; arbitrary-size integers. For the native compiler: type feedback (record the types each
 operation actually sees, then compile a specialized version), unboxed float
 fields, and caching compiled code inside built executables.
