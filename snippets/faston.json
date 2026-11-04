@@ -1,0 +1,235 @@
+{
+  "Function": {
+    "prefix": "def",
+    "body": ["def ${1:name}(${2}) {", "\t${0:pass;}", "}"],
+    "description": "Function definition"
+  },
+  "Class": {
+    "prefix": "class",
+    "body": [
+      "class ${1:Name} {",
+      "\tdef init(self${2:, }) {",
+      "\t\t${0:pass;}",
+      "\t}",
+      "}"
+    ],
+    "description": "Class with an init method"
+  },
+  "Subclass": {
+    "prefix": "classext",
+    "body": [
+      "class ${1:Name}(${2:Base}) {",
+      "\tdef init(self${3:, }) {",
+      "\t\t${2:Base}.init(self);",
+      "\t\t${0}",
+      "\t}",
+      "}"
+    ],
+    "description": "Class that inherits from another class"
+  },
+  "Exception class": {
+    "prefix": "exception",
+    "body": [
+      "class ${1:MyError}(${2:Exception}) {",
+      "\tdef init(self, ${3:message}) {",
+      "\t\t${2:Exception}.init(self, ${3:message});",
+      "\t\t${0}",
+      "\t}",
+      "}"
+    ],
+    "description": "Custom exception class"
+  },
+  "Method": {
+    "prefix": "defs",
+    "body": ["def ${1:name}(self${2}) {", "\t${0:pass;}", "}"],
+    "description": "Method definition (with self)"
+  },
+  "init": {
+    "prefix": "init",
+    "body": ["def init(self${1}) {", "\t${0:pass;}", "}"],
+    "description": "Constructor (Faston's __init__)"
+  },
+  "__repr__": {
+    "prefix": "repr",
+    "body": ["def __repr__(self) {", "\treturn f\"${1:Name}(${0})\";", "}"],
+    "description": "__repr__ method"
+  },
+  "__str__": {
+    "prefix": "str",
+    "body": ["def __str__(self) {", "\treturn f\"${0}\";", "}"],
+    "description": "__str__ method"
+  },
+  "Operator method": {
+    "prefix": "dunder",
+    "body": [
+      "def __${1|add,sub,mul,truediv,floordiv,mod,pow,eq,ne,lt,le,gt,ge,len,bool,getitem,setitem,contains,iter,call,neg,and,or,xor,radd,rsub,rmul|}__(self${2:, other}) {",
+      "\t${0:pass;}",
+      "}"
+    ],
+    "description": "Operator method (__add__, __eq__, ...)"
+  },
+  "if": {
+    "prefix": "if",
+    "body": ["if (${1:condition}) {", "\t${0}", "}"],
+    "description": "if statement"
+  },
+  "if / else": {
+    "prefix": "ife",
+    "body": ["if (${1:condition}) {", "\t${2}", "} else {", "\t${0}", "}"],
+    "description": "if / else"
+  },
+  "elif": {
+    "prefix": "elif",
+    "body": ["elif (${1:condition}) {", "\t${0}", "}"],
+    "description": "elif branch"
+  },
+  "else": {
+    "prefix": "else",
+    "body": ["else {", "\t${0}", "}"],
+    "description": "else branch"
+  },
+  "for in": {
+    "prefix": "for",
+    "body": ["for (${1:item} in ${2:items}) {", "\t${0}", "}"],
+    "description": "for loop over an iterable"
+  },
+  "for range": {
+    "prefix": "forr",
+    "body": ["for (${1:i} in range(${2:n})) {", "\t${0}", "}"],
+    "description": "for loop over range()"
+  },
+  "for items": {
+    "prefix": "fork",
+    "body": ["for (${1:key}, ${2:value} in ${3:d}.items()) {", "\t${0}", "}"],
+    "description": "for loop over a dict's items"
+  },
+  "for enumerate": {
+    "prefix": "fore",
+    "body": ["for (${1:i}, ${2:item} in enumerate(${3:items})) {", "\t${0}", "}"],
+    "description": "for loop with an index"
+  },
+  "while": {
+    "prefix": "while",
+    "body": ["while (${1:condition}) {", "\t${0}", "}"],
+    "description": "while loop"
+  },
+  "try / except": {
+    "prefix": "try",
+    "body": ["try {", "\t${1}", "} except (${2:Exception} as ${3:e}) {", "\t${0:print($3);}", "}"],
+    "description": "try / except"
+  },
+  "try / except / finally": {
+    "prefix": "tryf",
+    "body": [
+      "try {",
+      "\t${1}",
+      "} except (${2:Exception} as ${3:e}) {",
+      "\t${4:print($3);}",
+      "} finally {",
+      "\t${0}",
+      "}"
+    ],
+    "description": "try / except / finally"
+  },
+  "except": {
+    "prefix": "except",
+    "body": ["except (${1:Exception} as ${2:e}) {", "\t${0}", "}"],
+    "description": "except clause"
+  },
+  "finally": {
+    "prefix": "finally",
+    "body": ["finally {", "\t${0}", "}"],
+    "description": "finally clause"
+  },
+  "lambda": {
+    "prefix": "lambda",
+    "body": ["lambda (${1:x}) ${0:x}"],
+    "description": "lambda expression"
+  },
+  "lambda block": {
+    "prefix": "lambdab",
+    "body": ["lambda (${1:x}) {", "\t${0:return $1;}", "}"],
+    "description": "lambda with a block body"
+  },
+  "let": {
+    "prefix": "let",
+    "body": ["let ${1:name} = ${0:value};"],
+    "description": "Variable declaration"
+  },
+  "const": {
+    "prefix": "const",
+    "body": ["const ${1:NAME} = ${0:value};"],
+    "description": "Constant declaration"
+  },
+  "print": {
+    "prefix": "print",
+    "body": ["print(${0});"],
+    "description": "print()"
+  },
+  "print f-string": {
+    "prefix": "printf",
+    "body": ["print(f\"${1}{${2:value}}\");"],
+    "description": "print an f-string"
+  },
+  "import": {
+    "prefix": "import",
+    "body": ["import ${1|math,random,time|};"],
+    "description": "Import a module"
+  },
+  "from import": {
+    "prefix": "from",
+    "body": ["from ${1:module} import ${0:name};"],
+    "description": "Import names from a module"
+  },
+  "list comprehension": {
+    "prefix": "lc",
+    "body": ["[${1:x} for ${2:x} in ${3:items}]"],
+    "description": "List comprehension"
+  },
+  "list comprehension with filter": {
+    "prefix": "lcf",
+    "body": ["[${1:x} for ${2:x} in ${3:items} if ${4:condition}]"],
+    "description": "List comprehension with a filter"
+  },
+  "dict comprehension": {
+    "prefix": "dc",
+    "body": ["{${1:k}: ${2:v} for ${1:k}, ${2:v} in ${3:pairs}}"],
+    "description": "Dict comprehension"
+  },
+  "main": {
+    "prefix": "main",
+    "body": ["def main() {", "\t${0}", "}", "", "main();"],
+    "description": "main function and call"
+  },
+  "game loop": {
+    "prefix": "gameloop",
+    "body": [
+      "import time;",
+      "",
+      "let running = True;",
+      "let last = time.perf_counter();",
+      "while (running) {",
+      "\tlet now = time.perf_counter();",
+      "\tlet dt = now - last;",
+      "\tlast = now;",
+      "\t${0}",
+      "}"
+    ],
+    "description": "Fixed-structure update loop with a delta time"
+  },
+  "region": {
+    "prefix": "region",
+    "body": ["# region ${1:name}", "${0}", "# endregion"],
+    "description": "Foldable region"
+  },
+  "assert": {
+    "prefix": "assert",
+    "body": ["assert ${1:condition}, \"${0:message}\";"],
+    "description": "assert statement"
+  },
+  "raise": {
+    "prefix": "raise",
+    "body": ["raise ${1:ValueError}(\"${0:message}\");"],
+    "description": "raise an exception"
+  }
+}
