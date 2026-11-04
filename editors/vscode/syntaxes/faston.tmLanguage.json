@@ -1,0 +1,446 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Faston",
+  "scopeName": "source.faston",
+  "fileTypes": ["fst"],
+  "patterns": [{ "include": "#statements" }],
+  "repository": {
+    "statements": {
+      "patterns": [
+        { "include": "#comment" },
+        { "include": "#import" },
+        { "include": "#class-declaration" },
+        { "include": "#function-declaration" },
+        { "include": "#lambda" },
+        { "include": "#declaration" },
+        { "include": "#expression" },
+        { "include": "#punctuation" }
+      ]
+    },
+    "expression": {
+      "patterns": [
+        { "include": "#comment" },
+        { "include": "#fstring" },
+        { "include": "#string" },
+        { "include": "#number" },
+        { "include": "#keywords" },
+        { "include": "#constants" },
+        { "include": "#self" },
+        { "include": "#builtin-exceptions" },
+        { "include": "#builtin-functions" },
+        { "include": "#member-access" },
+        { "include": "#function-call" },
+        { "include": "#type-name" },
+        { "include": "#operators" },
+        { "include": "#punctuation" }
+      ]
+    },
+    "comment": {
+      "patterns": [
+        {
+          "name": "comment.line.number-sign.faston",
+          "match": "(#)\\s*((?:end)?region\\b.*)$",
+          "captures": {
+            "1": { "name": "punctuation.definition.comment.faston" },
+            "2": { "name": "keyword.other.region.faston" }
+          }
+        },
+        {
+          "name": "comment.line.number-sign.faston",
+          "begin": "#",
+          "beginCaptures": { "0": { "name": "punctuation.definition.comment.faston" } },
+          "end": "$",
+          "patterns": [
+            { "match": "\\b(TODO|FIXME|XXX|HACK|NOTE)\\b", "name": "keyword.other.todo.faston" }
+          ]
+        }
+      ]
+    },
+    "import": {
+      "patterns": [
+        {
+          "begin": "\\b(from)\\s+([A-Za-z_]\\w*)\\s+(import)\\b",
+          "beginCaptures": {
+            "1": { "name": "keyword.control.import.faston" },
+            "2": { "name": "entity.name.namespace.faston" },
+            "3": { "name": "keyword.control.import.faston" }
+          },
+          "end": "(;)|(?=[}#])|$",
+          "endCaptures": { "1": { "name": "punctuation.terminator.statement.faston" } },
+          "patterns": [
+            { "match": "\\bas\\b", "name": "keyword.control.import.faston" },
+            { "match": ",", "name": "punctuation.separator.comma.faston" },
+            { "match": "\\*", "name": "keyword.operator.wildcard.faston" },
+            { "match": "[A-Za-z_]\\w*", "name": "variable.other.import.faston" }
+          ]
+        },
+        {
+          "begin": "\\b(import)\\b",
+          "beginCaptures": { "1": { "name": "keyword.control.import.faston" } },
+          "end": "(;)|(?=[}#])|$",
+          "endCaptures": { "1": { "name": "punctuation.terminator.statement.faston" } },
+          "patterns": [
+            { "match": "\\bas\\b", "name": "keyword.control.import.faston" },
+            { "match": ",", "name": "punctuation.separator.comma.faston" },
+            { "match": "\\b(math|random|time)\\b", "name": "support.type.module.faston entity.name.namespace.faston" },
+            { "match": "[A-Za-z_]\\w*", "name": "entity.name.namespace.faston" }
+          ]
+        }
+      ]
+    },
+    "class-declaration": {
+      "patterns": [
+        {
+          "match": "\\b(class)\\s+([A-Za-z_]\\w*)\\s*(?:(\\()\\s*([A-Za-z_][\\w.]*)?\\s*(\\)))?",
+          "captures": {
+            "1": { "name": "storage.type.class.faston" },
+            "2": { "name": "entity.name.type.class.faston" },
+            "3": { "name": "punctuation.definition.inheritance.begin.faston" },
+            "4": { "name": "entity.other.inherited-class.faston" },
+            "5": { "name": "punctuation.definition.inheritance.end.faston" }
+          }
+        }
+      ]
+    },
+    "function-declaration": {
+      "patterns": [
+        {
+          "begin": "\\b(def)\\s+(?:(__\\w+__|init)|([A-Za-z_]\\w*))\\s*(\\()",
+          "beginCaptures": {
+            "1": { "name": "storage.type.function.faston" },
+            "2": { "name": "entity.name.function.faston support.function.magic.faston" },
+            "3": { "name": "entity.name.function.faston" },
+            "4": { "name": "punctuation.definition.parameters.begin.faston" }
+          },
+          "end": "\\)",
+          "endCaptures": { "0": { "name": "punctuation.definition.parameters.end.faston" } },
+          "patterns": [{ "include": "#parameters" }]
+        }
+      ]
+    },
+    "lambda": {
+      "patterns": [
+        {
+          "begin": "\\b(lambda)\\s*(\\()",
+          "beginCaptures": {
+            "1": { "name": "storage.type.function.lambda.faston" },
+            "2": { "name": "punctuation.definition.parameters.begin.faston" }
+          },
+          "end": "\\)",
+          "endCaptures": { "0": { "name": "punctuation.definition.parameters.end.faston" } },
+          "patterns": [{ "include": "#parameters" }]
+        },
+        { "match": "\\blambda\\b", "name": "storage.type.function.lambda.faston" }
+      ]
+    },
+    "parameters": {
+      "patterns": [
+        { "include": "#comment" },
+        { "match": "\\bself\\b", "name": "variable.parameter.function.language.special.self.faston" },
+        {
+          "match": "(\\*\\*|\\*)?\\s*([A-Za-z_]\\w*)",
+          "captures": {
+            "1": { "name": "keyword.operator.unpacking.parameter.faston" },
+            "2": { "name": "variable.parameter.function.faston" }
+          }
+        },
+        {
+          "begin": "=",
+          "beginCaptures": { "0": { "name": "keyword.operator.assignment.faston" } },
+          "end": "(?=[,)])",
+          "patterns": [{ "include": "#nested-expression" }]
+        },
+        { "match": ",", "name": "punctuation.separator.parameters.faston" }
+      ]
+    },
+    "nested-expression": {
+      "patterns": [
+        {
+          "begin": "\\(",
+          "end": "\\)",
+          "patterns": [{ "include": "#nested-expression" }]
+        },
+        {
+          "begin": "\\[",
+          "end": "\\]",
+          "patterns": [{ "include": "#nested-expression" }]
+        },
+        {
+          "begin": "\\{",
+          "end": "\\}",
+          "patterns": [{ "include": "#nested-expression" }]
+        },
+        { "include": "#expression" }
+      ]
+    },
+    "declaration": {
+      "patterns": [
+        {
+          "match": "\\b(const)\\s+([A-Za-z_]\\w*)",
+          "captures": {
+            "1": { "name": "storage.modifier.const.faston" },
+            "2": { "name": "variable.other.constant.faston" }
+          }
+        },
+        {
+          "match": "\\b(let)\\b",
+          "name": "storage.type.let.faston"
+        },
+        {
+          "match": "\\b(global|nonlocal)\\b",
+          "name": "storage.modifier.scope.faston"
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "match": "\\b(if|elif|else|while|for|break|continue|return|pass|try|except|finally|raise|assert)\\b",
+          "name": "keyword.control.flow.faston"
+        },
+        {
+          "match": "\\b(and|or|not|in)\\b",
+          "name": "keyword.operator.logical.faston"
+        },
+        {
+          "match": "\\bas\\b",
+          "name": "keyword.control.as.faston"
+        },
+        {
+          "match": "\\b(def|class|lambda)\\b",
+          "name": "storage.type.faston"
+        },
+        {
+          "match": "\\b(let|const|global|nonlocal)\\b",
+          "name": "storage.modifier.faston"
+        },
+        {
+          "match": "\\b(import|from)\\b",
+          "name": "keyword.control.import.faston"
+        }
+      ]
+    },
+    "constants": {
+      "patterns": [
+        { "match": "\\b(True|False)\\b", "name": "constant.language.boolean.faston" },
+        { "match": "\\bNone\\b", "name": "constant.language.none.faston" },
+        { "match": "\\b[A-Z][A-Z0-9_]*[A-Z0-9]\\b(?!\\s*\\()", "name": "variable.other.constant.faston" }
+      ]
+    },
+    "self": {
+      "match": "\\bself\\b",
+      "name": "variable.language.special.self.faston"
+    },
+    "builtin-functions": {
+      "match": "(?<!\\.)\\b(print|input|len|range|str|repr|int|float|bool|list|tuple|set|type|isinstance|abs|min|max|sum|round|sorted|chr|ord|format|clock|exit|map|filter|enumerate|zip|any|all|callable)\\b(?=\\s*\\()",
+      "name": "support.function.builtin.faston"
+    },
+    "builtin-exceptions": {
+      "match": "(?<!\\.)\\b(BaseException|Exception|ArithmeticError|ZeroDivisionError|OverflowError|LookupError|IndexError|KeyError|TypeError|ValueError|NameError|AttributeError|RuntimeError|RecursionError|AssertionError|ImportError|OSError|IOError|SyntaxError|NotImplementedError|StopIteration)\\b",
+      "name": "support.type.exception.faston"
+    },
+    "member-access": {
+      "patterns": [
+        {
+          "match": "(\\.)\\s*(__\\w+__|init)\\s*(?=\\()",
+          "captures": {
+            "1": { "name": "punctuation.accessor.faston" },
+            "2": { "name": "entity.name.function.member.faston support.function.magic.faston" }
+          }
+        },
+        {
+          "match": "(\\.)\\s*([A-Za-z_]\\w*)\\s*(?=\\()",
+          "captures": {
+            "1": { "name": "punctuation.accessor.faston" },
+            "2": { "name": "entity.name.function.member.faston" }
+          }
+        },
+        {
+          "match": "(\\.)\\s*([A-Za-z_]\\w*)",
+          "captures": {
+            "1": { "name": "punctuation.accessor.faston" },
+            "2": { "name": "variable.other.property.faston" }
+          }
+        }
+      ]
+    },
+    "function-call": {
+      "patterns": [
+        {
+          "match": "\\b([A-Z]\\w*)\\s*(?=\\()",
+          "captures": { "1": { "name": "entity.name.type.class.faston meta.function-call.faston" } }
+        },
+        {
+          "match": "\\b([A-Za-z_]\\w*)\\s*(?=\\()",
+          "captures": { "1": { "name": "entity.name.function.call.faston meta.function-call.faston" } }
+        }
+      ]
+    },
+    "type-name": {
+      "match": "\\b[A-Z][a-z]\\w*\\b",
+      "name": "entity.name.type.faston"
+    },
+    "number": {
+      "patterns": [
+        { "match": "\\b0[xX][0-9a-fA-F_]+\\b", "name": "constant.numeric.hex.faston" },
+        { "match": "\\b\\d[\\d_]*\\.\\d[\\d_]*(?:[eE][+-]?\\d+)?\\b", "name": "constant.numeric.float.faston" },
+        { "match": "\\b\\d[\\d_]*[eE][+-]?\\d+\\b", "name": "constant.numeric.float.faston" },
+        { "match": "\\b\\d[\\d_]*\\b", "name": "constant.numeric.integer.faston" }
+      ]
+    },
+    "escape": {
+      "patterns": [
+        { "match": "\\\\[ntr0\\\\'\"]", "name": "constant.character.escape.faston" },
+        { "match": "\\\\$", "name": "constant.character.escape.line-continuation.faston" }
+      ]
+    },
+    "string": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.faston",
+          "begin": "\"",
+          "beginCaptures": { "0": { "name": "punctuation.definition.string.begin.faston" } },
+          "end": "\"",
+          "endCaptures": { "0": { "name": "punctuation.definition.string.end.faston" } },
+          "patterns": [{ "include": "#escape" }]
+        },
+        {
+          "name": "string.quoted.single.faston",
+          "begin": "'",
+          "beginCaptures": { "0": { "name": "punctuation.definition.string.begin.faston" } },
+          "end": "'",
+          "endCaptures": { "0": { "name": "punctuation.definition.string.end.faston" } },
+          "patterns": [{ "include": "#escape" }]
+        }
+      ]
+    },
+    "fstring": {
+      "patterns": [
+        {
+          "name": "string.interpolated.faston",
+          "begin": "\\b([fF])(\")",
+          "beginCaptures": {
+            "1": { "name": "storage.type.string.faston" },
+            "2": { "name": "punctuation.definition.string.begin.faston" }
+          },
+          "end": "\"",
+          "endCaptures": { "0": { "name": "punctuation.definition.string.end.faston" } },
+          "patterns": [
+            { "include": "#escape" },
+            { "include": "#fstring-braces" },
+            { "include": "#fstring-interpolation-double" }
+          ]
+        },
+        {
+          "name": "string.interpolated.faston",
+          "begin": "\\b([fF])(')",
+          "beginCaptures": {
+            "1": { "name": "storage.type.string.faston" },
+            "2": { "name": "punctuation.definition.string.begin.faston" }
+          },
+          "end": "'",
+          "endCaptures": { "0": { "name": "punctuation.definition.string.end.faston" } },
+          "patterns": [
+            { "include": "#escape" },
+            { "include": "#fstring-braces" },
+            { "include": "#fstring-interpolation-single" }
+          ]
+        }
+      ]
+    },
+    "fstring-braces": {
+      "match": "\\{\\{|\\}\\}",
+      "name": "constant.character.escape.brace.faston"
+    },
+    "fstring-format-spec": {
+      "match": "(:)([^{}\"':]*)(?=\\})",
+      "captures": {
+        "1": { "name": "punctuation.separator.format-spec.faston" },
+        "2": { "name": "constant.other.format-spec.faston" }
+      }
+    },
+    "fstring-interpolation-double": {
+      "name": "meta.interpolation.faston",
+      "contentName": "meta.embedded.inline.faston",
+      "begin": "\\{",
+      "beginCaptures": { "0": { "name": "punctuation.section.interpolation.begin.faston" } },
+      "end": "\\}|(?=\")",
+      "endCaptures": { "0": { "name": "punctuation.section.interpolation.end.faston" } },
+      "patterns": [
+        { "include": "#fstring-format-spec" },
+        { "include": "#string-single-only" },
+        { "include": "#fstring-expression" }
+      ]
+    },
+    "fstring-interpolation-single": {
+      "name": "meta.interpolation.faston",
+      "contentName": "meta.embedded.inline.faston",
+      "begin": "\\{",
+      "beginCaptures": { "0": { "name": "punctuation.section.interpolation.begin.faston" } },
+      "end": "\\}|(?=')",
+      "endCaptures": { "0": { "name": "punctuation.section.interpolation.end.faston" } },
+      "patterns": [
+        { "include": "#fstring-format-spec" },
+        { "include": "#string-double-only" },
+        { "include": "#fstring-expression" }
+      ]
+    },
+    "string-single-only": {
+      "name": "string.quoted.single.faston",
+      "begin": "'",
+      "end": "'|(?=\")",
+      "patterns": [{ "include": "#escape" }]
+    },
+    "string-double-only": {
+      "name": "string.quoted.double.faston",
+      "begin": "\"",
+      "end": "\"|(?=')",
+      "patterns": [{ "include": "#escape" }]
+    },
+    "fstring-expression": {
+      "patterns": [
+        {
+          "begin": "\\(",
+          "end": "\\)",
+          "patterns": [{ "include": "#string-single-only" }, { "include": "#string-double-only" }, { "include": "#fstring-expression" }]
+        },
+        {
+          "begin": "\\[",
+          "end": "\\]",
+          "patterns": [{ "include": "#string-single-only" }, { "include": "#string-double-only" }, { "include": "#fstring-expression" }]
+        },
+        { "include": "#number" },
+        { "include": "#keywords" },
+        { "include": "#constants" },
+        { "include": "#self" },
+        { "include": "#builtin-functions" },
+        { "include": "#member-access" },
+        { "include": "#function-call" },
+        { "include": "#operators" },
+        { "match": ",", "name": "punctuation.separator.comma.faston" },
+        { "match": "[A-Za-z_]\\w*", "name": "variable.other.faston" }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        { "match": "&&|\\|\\||!(?!=)", "name": "keyword.operator.logical.faston" },
+        { "match": "==|!=|<=|>=|<(?!<)|>(?!>)", "name": "keyword.operator.comparison.faston" },
+        { "match": "\\+=|-=|\\*=|/=|%=|&=|\\|=|\\^=", "name": "keyword.operator.assignment.compound.faston" },
+        { "match": "=", "name": "keyword.operator.assignment.faston" },
+        { "match": "\\*\\*|//|[-+*/%]", "name": "keyword.operator.arithmetic.faston" },
+        { "match": "<<|>>|[&|^~]", "name": "keyword.operator.bitwise.faston" }
+      ]
+    },
+    "punctuation": {
+      "patterns": [
+        { "match": ";", "name": "punctuation.terminator.statement.faston" },
+        { "match": ",", "name": "punctuation.separator.comma.faston" },
+        { "match": ":", "name": "punctuation.separator.colon.faston" },
+        { "match": "\\.", "name": "punctuation.accessor.faston" },
+        { "match": "[{}]", "name": "punctuation.section.block.faston" },
+        { "match": "[()]", "name": "punctuation.parenthesis.faston" },
+        { "match": "[\\[\\]]", "name": "punctuation.definition.list.faston" }
+      ]
+    }
+  }
+}
