@@ -8,6 +8,7 @@
     "statements": {
       "patterns": [
         { "include": "#comment" },
+        { "include": "#decorator" },
         { "include": "#import" },
         { "include": "#class-declaration" },
         { "include": "#function-declaration" },
@@ -56,6 +57,13 @@
         }
       ]
     },
+    "decorator": {
+      "match": "(@)\\s*([A-Za-z_][\\w.]*)",
+      "captures": {
+        "1": { "name": "punctuation.definition.decorator.faston entity.name.function.decorator.faston" },
+        "2": { "name": "entity.name.function.decorator.faston" }
+      }
+    },
     "import": {
       "patterns": [
         {
@@ -82,7 +90,7 @@
           "patterns": [
             { "match": "\\bas\\b", "name": "keyword.control.import.faston" },
             { "match": ",", "name": "punctuation.separator.comma.faston" },
-            { "match": "\\b(math|random|time)\\b", "name": "support.type.module.faston entity.name.namespace.faston" },
+            { "match": "\\b(math|random|time|os|sys|json|shutil|gui)\\b", "name": "support.type.module.faston entity.name.namespace.faston" },
             { "match": "[A-Za-z_]\\w*", "name": "entity.name.namespace.faston" }
           ]
         }
@@ -195,11 +203,11 @@
     "keywords": {
       "patterns": [
         {
-          "match": "\\b(if|elif|else|while|for|break|continue|return|pass|try|except|finally|raise|assert)\\b",
+          "match": "\\b(if|elif|else|while|for|break|continue|return|pass|try|except|finally|raise|assert|with|del|yield)\\b",
           "name": "keyword.control.flow.faston"
         },
         {
-          "match": "\\b(and|or|not|in)\\b",
+          "match": "\\b(and|or|not|in|is)\\b",
           "name": "keyword.operator.logical.faston"
         },
         {
@@ -232,11 +240,11 @@
       "name": "variable.language.special.self.faston"
     },
     "builtin-functions": {
-      "match": "(?<!\\.)\\b(print|input|len|range|str|repr|int|float|bool|list|tuple|set|type|isinstance|abs|min|max|sum|round|sorted|chr|ord|format|clock|exit|map|filter|enumerate|zip|any|all|callable)\\b(?=\\s*\\()",
+      "match": "(?<!\\.)\\b(print|input|len|range|str|repr|int|float|bool|list|tuple|set|type|isinstance|abs|min|max|sum|round|sorted|chr|ord|format|clock|exit|map|filter|enumerate|zip|any|all|callable|open|dict|divmod|pow|hex|oct|bin|reversed|getattr|setattr|hasattr|id|hash|issubclass|iter|next|property|staticmethod|classmethod)\\b(?=\\s*\\()",
       "name": "support.function.builtin.faston"
     },
     "builtin-exceptions": {
-      "match": "(?<!\\.)\\b(BaseException|Exception|ArithmeticError|ZeroDivisionError|OverflowError|LookupError|IndexError|KeyError|TypeError|ValueError|NameError|AttributeError|RuntimeError|RecursionError|AssertionError|ImportError|OSError|IOError|SyntaxError|NotImplementedError|StopIteration)\\b",
+      "match": "(?<!\\.)\\b(BaseException|Exception|ArithmeticError|ZeroDivisionError|OverflowError|LookupError|IndexError|KeyError|TypeError|ValueError|NameError|AttributeError|RuntimeError|RecursionError|AssertionError|ImportError|OSError|IOError|SyntaxError|NotImplementedError|StopIteration|FileNotFoundError|FileExistsError|PermissionError|IsADirectoryError|NotADirectoryError|TimeoutError|EOFError|ModuleNotFoundError|UnicodeError|JSONDecodeError|KeyboardInterrupt|GeneratorExit)\\b",
       "name": "support.type.exception.faston"
     },
     "member-access": {

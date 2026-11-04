@@ -332,7 +332,7 @@ class Analysis {
         if (!t) return null;
         const M = T.match;
         const next = T[k + 1];
-        const simpleEnd = (j) => !T[j] || [';', ',', ')', ']', '}'].includes(T[j].v);
+        const simpleEnd = (j) => !T[j] || [';', ',', ')', ']', '}', 'as'].includes(T[j].v);
         // a postfix chain ending in a call: Foo(...), a.b(...), "x".split(), make()(...)
         if (t.t === 'id' || t.t === 'str' || t.t === 'fstr') {
             let j = k + 1, last = k;
@@ -556,6 +556,27 @@ class Analysis {
                         for (const nt of names) this.define(scope, { name: nt.v, kind: 'variable', tok: nt, loopVar: true, comp: !loop });
                         break;
                     }
+                    case 'with': {
+                        // with (expr as name, expr2 as name2) { ... }
+                        if (!T[i + 1] || T[i + 1].v !== '(') break;
+                        const c = M[i + 1];
+                        let start = i + 2;
+                        let depth = 0;
+                        for (let k = i + 2; k <= c && k < T.length; k++) {
+                            const v = T[k].v;
+                            if (k < c && T[k].t === 'op' && OPEN[v]) depth++;
+                            else if (k < c && T[k].t === 'op' && CLOSE[v]) depth--;
+                            if (k === c || (depth === 0 && v === ',')) {
+                                for (let j = start; j < k; j++) {
+                                    if (T[j].t === 'kw' && T[j].v === 'as' && T[j + 1] && T[j + 1].t === 'id') {
+                                        this.define(scope, { name: T[j + 1].v, kind: 'variable', tok: T[j + 1], hint: this.valueHint(T, start) });
+                                    }
+                                }
+                                start = k + 1;
+                            }
+                        }
+                        break;
+                    }
                     case 'except': {
                         if (!T[i + 1] || T[i + 1].v !== '(') break;
                         const c = M[i + 1];
@@ -764,7 +785,9 @@ function typeOfEntity(ent, depth = 0) {
         case 'exception': return { t: 'exceptionClass', name: ent.name };
         case 'moduleMember': {
             const m = BI.MODULES[ent.module].members[ent.name];
-            return m && m.value ? { t: 'builtin', name: 'float' } : { t: 'function' };
+            if (m && m.module) return { t: 'module', builtin: m.module };
+            if (m && m.value) return { t: 'builtin', name: typeof m.value === 'string' ? m.value : 'float' };
+            return { t: 'function' };
         }
         case 'symbol': {
             const { an, sym } = ent;
@@ -954,7 +977,7 @@ function callSignature(ent, viaInstance) {
         }
         case 'moduleMember': {
             const m = BI.MODULES[ent.module].members[ent.name];
-            if (m.value) return null;
+            if (m.value || m.module) return null;
             return { name: `${ent.module}.${ent.name}`, params: m.params, doc: m.doc };
         }
         case 'method': {

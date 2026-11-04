@@ -25,7 +25,7 @@ function lint(an, opts = {}) {
         }
     }
 
-    // super() doesn't exist
+    // super() works in methods of classes with a base class
     const superToks = new Set();
     for (let i = 0; i < T.length; i++) {
         const t = T[i];
@@ -33,11 +33,12 @@ function lint(an, opts = {}) {
             && (!T[i - 1] || T[i - 1].v !== '.')) {
             superToks.add(t);
             const cls = an.enclosingClass(t.s);
-            const base = cls && cls.base;
-            out.push({
-                s: t.s, e: T[i + 2] ? T[i + 2].e : t.e, severity: 'warning', code: 'faston.super', data: { base },
-                message: `Faston has no super(): call the parent class directly, e.g. ${base || 'Base'}.init(self, ...).`,
-            });
+            if (cls && !cls.base) {
+                out.push({
+                    s: t.s, e: t.e, severity: 'error', code: 'faston.super',
+                    message: `super() needs a base class: class ${cls.name}(Parent) { ... }`,
+                });
+            }
         }
     }
 

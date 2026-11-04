@@ -156,6 +156,10 @@ function typeName(t) {
 function codeBlock(s) {
     return '```faston\n' + s + '\n```';
 }
+/** Type of a module constant (math.pi: float, sys.argv: list, ...). */
+function memberType(m) {
+    return typeof m.value === 'string' ? m.value : 'float';
+}
 
 // =================================================================== describing entities
 
@@ -198,7 +202,8 @@ function describe(ent, fromAn) {
         }
         case 'moduleMember': {
             const m = BI.MODULES[ent.module].members[ent.name];
-            md.appendMarkdown(codeBlock(m.value ? `${ent.module}.${ent.name}: float` : BI.signature(`${ent.module}.${ent.name}`, m)) + '\n\n' + m.doc);
+            if (m.module) return describeModule(md, null, m.module);
+            md.appendMarkdown(codeBlock(m.value ? `${ent.module}.${ent.name}: ${memberType(m)}` : BI.signature(`${ent.module}.${ent.name}`, m)) + '\n\n' + m.doc);
             return md;
         }
         case 'method': {
@@ -284,7 +289,7 @@ function completionKind(ent) {
     switch (ent.kind) {
         case 'builtinFn': return CK.Function;
         case 'exception': return CK.Class;
-        case 'moduleMember': return BI.MODULES[ent.module].members[ent.name].value ? CK.Constant : CK.Function;
+        case 'moduleMember': { const m = BI.MODULES[ent.module].members[ent.name]; return m.module ? CK.Module : m.value ? CK.Constant : CK.Function; }
         case 'method': return BI.METHODS[ent.type][ent.name].field ? CK.Field : CK.Method;
         case 'symbol':
             switch (ent.sym.kind) {
@@ -303,7 +308,7 @@ function completionKind(ent) {
 function isCallable(ent) {
     if (!ent) return false;
     if (ent.kind === 'builtinFn' || ent.kind === 'exception') return true;
-    if (ent.kind === 'moduleMember') return !BI.MODULES[ent.module].members[ent.name].value;
+    if (ent.kind === 'moduleMember') { const m = BI.MODULES[ent.module].members[ent.name]; return !m.value && !m.module; }
     if (ent.kind === 'method') return !BI.METHODS[ent.type][ent.name].field;
     if (ent.kind === 'symbol') return ['class', 'function', 'method'].includes(ent.sym.kind);
     return false;
@@ -315,7 +320,8 @@ function detailOf(ent) {
         case 'exception': return 'built-in exception';
         case 'moduleMember': {
             const m = BI.MODULES[ent.module].members[ent.name];
-            return m.value ? `${ent.module}.${ent.name}: float` : BI.signature(ent.name, m);
+            if (m.module) return `module ${m.module}`;
+            return m.value ? `${ent.module}.${ent.name}: ${memberType(m)}` : BI.signature(ent.name, m);
         }
         case 'method': {
             const m = BI.METHODS[ent.type][ent.name];
@@ -826,7 +832,7 @@ function classify(ent, t) {
         case 'builtinFn': return [TT.function, MOD.defaultLibrary];
         case 'exception': return [TT.class, MOD.defaultLibrary];
         case 'moduleMember':
-            return BI.MODULES[ent.module].members[ent.name].value ? [TT.variable, MOD.readonly | MOD.defaultLibrary] : [TT.function, MOD.defaultLibrary];
+            { const m = BI.MODULES[ent.module].members[ent.name]; return m.module ? [TT.namespace, MOD.defaultLibrary] : m.value ? [TT.variable, MOD.readonly | MOD.defaultLibrary] : [TT.function, MOD.defaultLibrary]; }
         case 'method': return BI.METHODS[ent.type][ent.name].field ? [TT.property, MOD.defaultLibrary] : [TT.method, MOD.defaultLibrary];
         case 'moduleRef': return [TT.namespace, 0];
         case 'symbol': {
@@ -1024,22 +1030,6 @@ const codeActionProvider = {
                 const fix = new vscode.CodeAction("Rename to 'init'", vscode.CodeActionKind.QuickFix);
                 fix.edit = new vscode.WorkspaceEdit();
                 fix.edit.replace(doc.uri, d.range, 'init');
-                fix.diagnostics = [d];
-                fix.isPreferred = true;
-                out.push(fix);
-            } else if (code === 'faston.super') {
-                const off = doc.offsetAt(d.range.start);
-                const tok = an.tokenAt(off);
-                const T = an.tokens;
-                if (!tok || tok.grp !== T) continue;
-                const i = tok.i;
-                const cls = an.enclosingClass(off);
-                // super ( ) . name (
-                if (!cls || !cls.base || !(T[i + 3] && T[i + 3].v === '.' && T[i + 4] && T[i + 4].t === 'id' && T[i + 5] && T[i + 5].v === '(')) continue;
-                const empty = T[i + 6] && T[i + 6].v === ')';
-                const fix = new vscode.CodeAction(`Call ${cls.base}.${T[i + 4].v}(self, ...) directly`, vscode.CodeActionKind.QuickFix);
-                fix.edit = new vscode.WorkspaceEdit();
-                fix.edit.replace(doc.uri, toRange(an, T[i].s, T[i + 5].e), `${cls.base}.${T[i + 4].v}(self${empty ? '' : ', '}`);
                 fix.diagnostics = [d];
                 fix.isPreferred = true;
                 out.push(fix);
