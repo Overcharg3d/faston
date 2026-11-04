@@ -355,6 +355,27 @@ extern "C" fn rt_compare(vm: &mut Vm, sp: u64, k: u64, a: *const Value, b: *cons
     }
 }
 
+/// Next item of the generator in loop state `*state` into `*out`:
+/// 1 = got one, 0 = exhausted (or not a generator), 2 = exception.
+extern "C" fn rt_gen_next(vm: &mut Vm, sp: u64, state: *const Value, out: *mut Value) -> u64 {
+    vm.sp = sp as usize;
+    let g = match unsafe { *state } {
+        Value::Obj(g) if matches!(g.get(), Obj::Generator(_)) => g,
+        _ => return 0,
+    };
+    match vm.resume_gen(g, Value::None) {
+        Ok(Some(v)) => {
+            unsafe { *out = v };
+            1
+        }
+        Ok(None) => 0,
+        Err(e) => {
+            vm.jit_err = e;
+            2
+        }
+    }
+}
+
 /// 0 / 1 = false / true, 2 = exception.
 extern "C" fn rt_truthy(vm: &mut Vm, sp: u64, a: *const Value) -> u64 {
     vm.sp = sp as usize;
@@ -1095,6 +1116,30 @@ impl Ctx<'_> {
             Op::Inherit | Op::Method(_) => {
                 pop!();
             }
+            Op::Is => {
+                pop!();
+                pop!();
+                push!(Ty::Bool);
+            }
+            Op::DelIndex => {
+                pop!();
+                pop!();
+            }
+            Op::DelAttr(_) => {
+                pop!();
+            }
+            Op::DelGlobal(_) => {}
+            Op::SetSlice => {
+                for _ in 0..5 {
+                    pop!();
+                }
+            }
+            Op::DelSlice => {
+                for _ in 0..4 {
+                    pop!();
+                }
+            }
+            // Gen / Yield: generator functions stay in the interpreter
             _ => return None,
         }
         Some(())
@@ -2580,7 +2625,13 @@ impl Cg<'_> {
             | Op::ExcMatch(_)
             | Op::Class(_)
             | Op::Inherit
-            | Op::Method(_) => self.cold(op, pre),
+            | Op::Method(_)
+            | Op::Is
+            | Op::DelIndex
+            | Op::DelAttr(_)
+            | Op::DelGlobal(_)
+            | Op::SetSlice
+            | Op::DelSlice => self.cold(op, pre),
             other => unreachable!("instruction {:?} reached the code generator", other),
         }
     }
@@ -2747,7 +2798,26 @@ impl Cg<'_> {
         self.b.ins().brif(is_list, listb, &[], tupc, &[]);
         self.b.switch_to_block(tupc);
         let is_tup = self.b.ins().icmp_imm_s(IntCC::Equal, k, kind::TUPLE as i64);
-        self.b.ins().brif(is_tup, tupb, &[], done_b, &[]);
+        let genb = self.b.create_block();
+        self.b.set_cold_block(genb);
+        self.b.ins().brif(is_tup, tupb, &[], genb, &[]);
+
+        // generator state: [gen, -, -]: resume it in the runtime
+        self.b.switch_to_block(genb);
+        self.set_ip();
+        let sp = self.abs(depth);
+        let stp = self.b.ins().iadd_imm_s(self.base, so as i64);
+        let vo = self.loff(v);
+        let outp = self.b.ins().iadd_imm_s(self.base, vo as i64);
+        let st = self.call_rt(rt_gen_next as *const () as usize, &[self.vm, sp, stp, outp]);
+        let got = self.check_bool(st);
+        let take_g = self.b.create_block();
+        self.b.ins().brif(got, take_g, &[], done_b, &[]);
+        self.b.switch_to_block(take_g);
+        let gt = self.ld(self.base, vo);
+        let gp = self.ld(self.base, vo + 8);
+        self.set_local(v, SV::D(gt, gp));
+        self.b.ins().jump(take, &[]);
         self.b.switch_to_block(listb);
         let n = self.ld(g, self.o.l.list_len);
         let ptr = self.ld(g, self.o.l.list_ptr);

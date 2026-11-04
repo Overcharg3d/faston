@@ -216,6 +216,25 @@ pub enum Op {
     Class(u32),
     Inherit,
     Method(u32),
+
+    /// [a, b] -> [a is b]
+    Is,
+    /// del obj[idx]: [obj, idx] -> []
+    DelIndex,
+    /// del obj.name: [obj] -> []
+    DelAttr(u32),
+    /// del name (a global)
+    DelGlobal(u32),
+    /// obj[start:stop:step] = v: [obj, start, stop, step, v] -> []
+    SetSlice,
+    /// del obj[start:stop:step]: [obj, start, stop, step] -> []
+    DelSlice,
+    /// First instruction of a generator function: wraps the new frame into a
+    /// generator object and returns it without running the body.
+    Gen,
+    /// Suspends the generator, handing the top of the stack to the caller; when it
+    /// resumes, the value sent in (None for `next`) is pushed. [v] -> [sent]
+    Yield,
 }
 
 impl Op {
@@ -278,6 +297,13 @@ impl Op {
             Op::JumpIfNotLeLC(..) | Op::JumpIfNotGtLC(..) | Op::JumpIfNotGeLC(..) => 0,
             Op::JumpIfNotEqLL(..) | Op::JumpIfNotNeLL(..) | Op::JumpIfNotLtLL(..) => 0,
             Op::JumpIfNotLeLL(..) | Op::JumpIfNotGtLL(..) | Op::JumpIfNotGeLL(..) => 0,
+            Op::Is => -1,
+            Op::DelIndex => -2,
+            Op::DelAttr(_) => -1,
+            Op::DelGlobal(_) => 0,
+            Op::SetSlice => -5,
+            Op::DelSlice => -4,
+            Op::Gen | Op::Yield => 0,
         }
     }
 

@@ -101,7 +101,80 @@ pub fn register(vm: &mut Vm) {
     vm.define_native("id", id_native);
     vm.define_native("hash", hash_native);
     vm.define_native("issubclass", issubclass_native);
+    vm.define_native("iter", iter_native);
+    vm.define_native("next", next_native);
+    vm.define_native("$classof", classof_native);
     register_modules(vm);
+}
+
+fn iter_native(vm: &mut Vm, args: &[Value]) -> R {
+    check_args("iter", args, 1, 1)?;
+    vm.make_iter(args[0])
+}
+
+fn next_native(vm: &mut Vm, args: &[Value]) -> R {
+    check_args("next", args, 1, 2)?;
+    let g = match args[0] {
+        Value::Obj(g) if matches!(g.get(), Obj::Generator(_)) => g,
+        v => {
+            // an object with __next__
+            let it = vm.make_iter(v)?;
+            match (v, it) {
+                (Value::Obj(a), Value::Obj(b)) if a != b && matches!(b.get(), Obj::Generator(gen) if matches!(gen.kind, GenKind::Next { .. })) => b,
+                _ => return Err(format!("TypeError: '{}' object is not an iterator", v.type_name())),
+            }
+        }
+    };
+    match vm.resume_gen(g, Value::None)? {
+        Some(v) => Ok(v),
+        None => match args.get(1) {
+            Some(&d) => Ok(d),
+            None => Err("StopIteration".into()),
+        },
+    }
+}
+
+/// The class of an instance (None otherwise); used by `with` to call __exit__.
+fn classof_native(_: &mut Vm, args: &[Value]) -> R {
+    Ok(match args.first() {
+        Some(Value::Obj(g)) => match g.get() {
+            Obj::Instance(i) => Value::Obj(i.class),
+            _ => Value::None,
+        },
+        _ => Value::None,
+    })
+}
+
+fn generator_method(vm: &mut Vm, g: Gc, name: u32, args: &[Value]) -> Option<R> {
+    let n = vm.syms.name(name).to_string();
+    Some(match n.as_str() {
+        "send" => (|| {
+            check_args("send", args, 1, 1)?;
+            match vm.resume_gen(g, args[0])? {
+                Some(v) => Ok(v),
+                None => Err("StopIteration".into()),
+            }
+        })(),
+        "__next__" => (|| match vm.resume_gen(g, Value::None)? {
+            Some(v) => Ok(v),
+            None => Err("StopIteration".into()),
+        })(),
+        "__iter__" => Ok(Value::Obj(g)),
+        "close" => {
+            if let Obj::Generator(gen) = g.get_mut() {
+                if gen.state == gen_state::RUNNING {
+                    return Some(Err("ValueError: generator already executing".into()));
+                }
+                gen.state = gen_state::DONE;
+                if let GenKind::Frame { saved, handlers, .. } = &mut gen.kind {
+                    saved.clear();
+                    handlers.clear();
+                }
+            }
+            Ok(Value::None)
+        }
+        _ => return None,
+    })
 }
 
 fn dict_native(vm: &mut Vm, args: &[Value]) -> R {
@@ -1563,6 +1636,7 @@ pub fn call_method(vm: &mut Vm, recv: Value, name: u32, args: &[Value]) -> R {
                 let n = vm.syms.name(name).to_string();
                 method(vm, g, &n, args)
             }
+            Obj::Generator(_) => generator_method(vm, g, name, args),
             _ => None,
         };
         if let Some(r) = r {

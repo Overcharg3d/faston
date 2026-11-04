@@ -1,0 +1,51 @@
+True False False True True True
+{'x': 1, 'z': 3} [1, 2, 3, 4, 5, 6, 7, 8]
+[1, 4, 5, 6, 7, 8]
+[4, 6, 8]
+False True
+gone is gone
+[1, 'a', 'b', 'c', 4, 5]
+['b', 'c', 4, 5]
+[10, 'c', 20, 5]
+[10, 'c', 20, 5, 99]
+Rex makes a sound (woof) roll
+HELLO ANN! [8, 8, 8] HEY!!
+30 86.0 C C
+0 2 Temp
+ValueError: too cold
+no setter
+enter a
+body a
+exit a True None
+enter outer
+enter inner
+nested body inner
+exit inner True None
+exit outer True None
+enter swallower
+exit swallower False ignored
+enter raiser
+exit raiser False k
+propagated k
+enter early
+exit early True None
+returned
+enter loop0
+exit loop0 True None
+enter loop1
+exit loop1 True None
+[0, 1, 2, 3, 4] 5050
+got 0
+got 1
+got 2
+[0, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89]
+0 1 done
+StopIteration
+0 5 15
+[1, 2, 'a', 'b', 0, 1]
+cleanup
+[1, 2]
+{'a': 1, 'b': 2} True generator
+1 [2, 3]
+[3, 2, 1] [20, 10]
+[3, 2, 1, 0] 6 14

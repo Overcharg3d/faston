@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::bytecode::Op;
 use crate::lexer::{Tok, Token};
-use crate::value::{Function, Gc, Heap, Interner, Obj, Value};
+use crate::value::{sym, Function, Gc, Heap, Interner, Obj, Value};
 
 /// Global variable table of one module, shared by every compilation run of it
 /// (so the REPL works).
@@ -64,6 +64,17 @@ struct LoopCtx {
     active_depth: usize,
 }
 
+/// What leaving an active `SetupTry` region early (return/break/continue) must do.
+#[derive(Clone, Copy)]
+enum Cleanup {
+    /// An `except` handler: just pop it.
+    Handler,
+    /// A `finally` guard: pop it and run the block at this token range.
+    Finally((usize, usize)),
+    /// A `with` guard: pop it and call `__exit__(None, None, None)` on the manager in this local.
+    With(u32),
+}
+
 struct FnState {
     name: String,
     code: Vec<Op>,
@@ -85,13 +96,19 @@ struct FnState {
     /// Compile-time mirror of the VM's handler stack inside this function: each entry
     /// is a `SetupTry` that is active here, with the token range of its `finally` block
     /// (if it is a finally guard). `return`/`break`/`continue` pop them and run finallys.
-    active: Vec<Option<(usize, usize)>>,
+    active: Vec<Cleanup>,
     /// Hidden locals holding the exception being handled (for bare `raise;`).
     exc_slots: Vec<u32>,
     /// Parameter names (symbols) and `*args` / `**kwargs` flags, set by `params`.
     param_syms: Vec<u32>,
     varargs: bool,
     varkw: bool,
+    /// The body contains `yield`: calling the function makes a generator.
+    is_generator: bool,
+    /// A method of a class (so `super()` works); the token range of the class's
+    /// base-class expression, if it has one.
+    is_method: bool,
+    class_base: Option<(usize, usize)>,
 }
 
 impl FnState {
@@ -118,6 +135,9 @@ impl FnState {
             param_syms: Vec::new(),
             varargs: false,
             varkw: false,
+            is_generator: false,
+            is_method: false,
+            class_base: None,
         }
     }
 
@@ -278,6 +298,11 @@ pub struct Compiler<'g> {
     /// Token ranges of default-argument expressions of the function just compiled,
     /// evaluated in the enclosing scope when the `def` runs (see `emit_function`).
     pending_defaults: Vec<(usize, usize)>,
+    /// Set while compiling a class body: the next `function` is a method of a class
+    /// with this base-class token range.
+    pending_method: Option<Option<(usize, usize)>>,
+    /// `del` target being parsed: the last accessor deletes instead of reading.
+    del_mode: bool,
 }
 
 impl<'g> Compiler<'g> {
@@ -297,6 +322,8 @@ impl<'g> Compiler<'g> {
             syms,
             unit,
             pending_defaults: Vec::new(),
+            pending_method: None,
+            del_mode: false,
         }
     }
 
@@ -727,6 +754,15 @@ impl<'g> Compiler<'g> {
             Tok::Try => self.try_stmt(),
             Tok::Raise => self.raise_stmt(),
             Tok::Assert => self.assert_stmt(),
+            Tok::Del => self.del_stmt(),
+            Tok::With => self.with_stmt(),
+            Tok::At => self.decorated(),
+            Tok::Yield => {
+                self.yield_expr()?;
+                self.expect(Tok::Semi, "expected ';' after yield")?;
+                self.emit(Op::Pop);
+                Ok(())
+            }
             Tok::Ident(_) if self.toks[self.pos + 1].tok == Tok::Comma => self.multi_assign(),
             Tok::Pass => {
                 self.advance();
@@ -936,9 +972,19 @@ impl<'g> Compiler<'g> {
     /// Parses `(params) { body }` and returns the compiled function.
     fn function(&mut self, name: String, is_init: bool) -> Res<Gc> {
         self.fns.push(FnState::new(name, false, is_init));
+        if let Some(base) = self.pending_method.take() {
+            self.f().is_method = true;
+            self.f().class_base = base;
+        }
         self.expect(Tok::LParen, "expected '(' after function name")?;
         let (arity, defaults, dynamic) = self.params()?;
         self.hoist_locals()?;
+        if self.cur().is_generator {
+            if is_init {
+                return Err(self.error("init() can't be a generator (it contains 'yield')"));
+            }
+            self.emit(Op::Gen);
+        }
         self.block()?;
         if is_init {
             self.emit(Op::GetLocal(0));
@@ -965,6 +1011,9 @@ impl<'g> Compiler<'g> {
         let (arity, defaults, dynamic) = self.params()?;
         if self.check(&Tok::LBrace) {
             self.hoist_locals()?;
+            if self.cur().is_generator {
+                return Err(self.error("a lambda can't contain 'yield' (use def)"));
+            }
             self.block()?;
             self.emit(Op::None);
         } else {
@@ -986,8 +1035,17 @@ impl<'g> Compiler<'g> {
         let mut excluded: HashSet<String> = HashSet::new();
         let mut i = self.pos + 1;
         let mut stmt_start = true;
+        let mut saw_yield = false;
         while i < end - 1 {
             match &self.toks[i].tok {
+                Tok::Yield => {
+                    saw_yield = true;
+                    stmt_start = false;
+                }
+                // decorators: skip `@expr` so its names aren't taken for assignments
+                Tok::At => {
+                    stmt_start = false;
+                }
                 Tok::Def => {
                     i += 2;
                     i = self.skip_group(i, Tok::LParen, Tok::RParen, "expected '('")?;
@@ -1055,6 +1113,9 @@ impl<'g> Compiler<'g> {
             if !excluded.contains(&n) && self.resolve_local(&n).is_none() {
                 self.declare_local(&n, false)?;
             }
+        }
+        if saw_yield {
+            self.f().is_generator = true;
         }
         Ok(())
     }
@@ -1174,37 +1235,332 @@ impl<'g> Compiler<'g> {
 
     fn class_decl(&mut self) -> Res<()> {
         self.advance();
+        let name = self.class_value()?;
+        self.define_named(&name)
+    }
+
+    /// `class Name(Base) { ... }` after the `class` keyword: leaves the class on the
+    /// stack and returns its name.
+    fn class_value(&mut self) -> Res<String> {
         let name = self.expect_ident("expected class name after 'class'")?;
         let n = self.name_const(&name);
         self.emit(Op::Class(n));
+        let mut base = None;
         if self.matches(&Tok::LParen) {
+            let start = self.pos;
             self.expression()?;
+            base = Some((start, self.pos));
             self.expect(Tok::RParen, "expected ')' after superclass")?;
             self.emit(Op::Inherit);
         }
         self.expect(Tok::LBrace, "expected '{' before class body")?;
+        let mut members: HashSet<String> = HashSet::new();
         while !self.check(&Tok::RBrace) && !self.check(&Tok::Eof) {
-            if self.matches(&Tok::Def) {
+            if self.check(&Tok::At) || self.check(&Tok::Def) {
+                // [decorators] def name(self, ...) { ... }
+                let mut ndec = 0;
+                while self.matches(&Tok::At) {
+                    // `@prop.setter`: `prop` is an earlier member of this class
+                    let accessor = match (&self.toks[self.pos].tok, &self.toks[self.pos + 1].tok, &self.toks[self.pos + 2].tok) {
+                        (Tok::Ident(p), Tok::Dot, Tok::Ident(a))
+                            if members.contains(p)
+                                && matches!(a.as_str(), "setter" | "getter" | "deleter")
+                                && self.toks[self.pos + 3].tok == Tok::Def =>
+                        {
+                            Some((p.clone(), a.clone()))
+                        }
+                        _ => None,
+                    };
+                    match accessor {
+                        Some((p, a)) => {
+                            self.pos += 3;
+                            self.emit(Op::Dup); // the class being built
+                            let pn = self.name_const(&p);
+                            self.emit(Op::GetAttr(pn));
+                            let an = self.name_const(&a);
+                            self.emit(Op::GetAttr(an));
+                        }
+                        None => {
+                            self.parse_or(false)?;
+                        }
+                    }
+                    ndec += 1;
+                }
+                self.expect(Tok::Def, "expected 'def' after a decorator in a class body")?;
                 let mname = self.expect_ident("expected method name after 'def'")?;
                 let is_init = mname == "init";
+                self.pending_method = Some(base);
                 let func = self.function(mname.clone(), is_init)?;
-                if func.as_func().arity == 0 && !func.as_func().varargs {
+                if ndec == 0 && func.as_func().arity == 0 && !func.as_func().varargs {
                     return Err(self.error_prev(&format!(
-                        "method '{}' needs a 'self' parameter",
+                        "method '{}' needs a 'self' parameter (or use @staticmethod)",
                         mname
                     )));
                 }
                 self.emit_function(func)?;
+                for _ in 0..ndec {
+                    self.emit(Op::Call(1));
+                }
                 let mn = self.name_const(&mname);
                 self.emit(Op::Method(mn));
+                members.insert(mname);
             } else if self.matches(&Tok::Pass) {
                 self.expect(Tok::Semi, "expected ';' after 'pass'")?;
+            } else if let Some(attr) = match (self.peek(), &self.toks[self.pos + 1].tok) {
+                (Tok::Ident(a), Tok::Assign) => Some(a.clone()),
+                _ => None,
+            } {
+                // class attribute: NAME = value;
+                self.pos += 2;
+                self.expression()?;
+                self.expect(Tok::Semi, "expected ';' after class attribute")?;
+                let an = self.name_const(&attr);
+                self.emit(Op::Method(an));
+                members.insert(attr);
             } else {
-                return Err(self.error("only 'def' methods are allowed in a class body"));
+                return Err(self.error(
+                    "a class body can only contain methods (def), class attributes (name = value;) and pass",
+                ));
             }
         }
         self.expect(Tok::RBrace, "expected '}' after class body")?;
-        self.define_named(&name)
+        Ok(name)
+    }
+
+    /// `@decorator ... def f() {}` / `@decorator class C {}`
+    fn decorated(&mut self) -> Res<()> {
+        let mut n = 0;
+        while self.matches(&Tok::At) {
+            self.parse_or(false)?;
+            n += 1;
+        }
+        match self.peek() {
+            Tok::Def => {
+                self.advance();
+                let name = self.expect_ident("expected function name after 'def'")?;
+                let f = self.cur();
+                if !f.is_script
+                    && !f.global_decls.contains(&name)
+                    && !f.nonlocal_decls.contains(&name)
+                    && self.resolve_local(&name).is_none()
+                {
+                    self.declare_local(&name, false)?;
+                }
+                let func = self.function(name.clone(), false)?;
+                self.emit_function(func)?;
+                for _ in 0..n {
+                    self.emit(Op::Call(1));
+                }
+                self.define_named(&name)
+            }
+            Tok::Class => {
+                self.advance();
+                let name = self.class_value()?;
+                for _ in 0..n {
+                    self.emit(Op::Call(1));
+                }
+                self.define_named(&name)
+            }
+            _ => Err(self.error("expected 'def' or 'class' after a decorator")),
+        }
+    }
+
+    /// `yield value`, `yield` (None) or `yield from iterable`; leaves the value sent
+    /// back in (None for plain iteration).
+    fn yield_expr(&mut self) -> Res<()> {
+        self.advance(); // yield
+        if self.cur().is_script {
+            return Err(self.error_prev("'yield' outside of a function"));
+        }
+        if !self.cur().is_generator {
+            return Err(self.error_prev("'yield' can only be used directly inside a def (not in a lambda)"));
+        }
+        if self.matches(&Tok::From) {
+            // for (x in iterable) { yield x; }
+            self.expression()?;
+            self.begin_scope();
+            let iter_slot = self.declare_iter_slots()?;
+            let var = self.declare_local("(yield from)", false)?;
+            self.emit(Op::GetIter(iter_slot));
+            let top = self.label();
+            let exit = self.emit(Op::ForIter(iter_slot, var, 0));
+            self.emit(Op::GetLocal(var));
+            self.emit(Op::Yield);
+            self.emit(Op::Pop);
+            self.emit(Op::Jump(top as u32));
+            self.patch(exit);
+            self.end_scope();
+            self.emit(Op::None);
+            return Ok(());
+        }
+        if matches!(self.peek(), Tok::Semi | Tok::RParen | Tok::RBracket | Tok::RBrace | Tok::Comma | Tok::Colon) {
+            self.emit(Op::None);
+        } else {
+            self.expr_list()?;
+        }
+        self.emit(Op::Yield);
+        Ok(())
+    }
+
+    /// `__exit__(None, None, None)` on the context manager in local `slot`.
+    fn emit_with_exit(&mut self, slot: u32) {
+        self.emit(Op::GetLocal(slot));
+        self.emit(Op::None);
+        self.emit(Op::None);
+        self.emit(Op::None);
+        self.emit(Op::Invoke(sym::D_EXIT, 3));
+        self.emit(Op::Pop);
+    }
+
+    /// with (open(path) as f, lock) { ... }
+    ///
+    ///       mgr = EXPR; f = mgr.__enter__()
+    ///       SetupTry HANDLER
+    ///       body
+    ///       PopTry; mgr.__exit__(None, None, None); Jump END
+    ///   HANDLER: (exception pushed)
+    ///       if (not mgr.__exit__(class, exc, None)) raise exc;
+    ///   END:
+    fn with_stmt(&mut self) -> Res<()> {
+        self.advance(); // with
+        self.expect(Tok::LParen, "expected '(' after 'with'")?;
+        self.begin_scope();
+        let mut guards = Vec::new();
+        loop {
+            self.expression()?;
+            let hidden = format!("(with {})", self.cur().locals.len());
+            let slot = self.declare_local(&hidden, false)?;
+            self.emit(Op::SetLocal(slot));
+            self.emit(Op::GetLocal(slot));
+            self.emit(Op::Invoke(sym::D_ENTER, 0));
+            if self.matches(&Tok::As) {
+                let name = self.expect_ident("expected a name after 'as'")?;
+                self.define_named(&name)?;
+            } else {
+                self.emit(Op::Pop);
+            }
+            let boundary = self.cur().locals.len();
+            let base_stack = self.cur().cur_stack;
+            let setup = self.emit(Op::SetupTry(0));
+            self.f().active.push(Cleanup::With(slot));
+            guards.push((slot, setup, base_stack, boundary));
+            if !self.matches(&Tok::Comma) {
+                break;
+            }
+        }
+        self.expect(Tok::RParen, "expected ')' after with items")?;
+        self.scoped_block()?;
+        for (slot, setup, base_stack, boundary) in guards.into_iter().rev() {
+            self.emit(Op::PopTry);
+            self.f().active.pop();
+            self.emit_with_exit(slot);
+            let done = self.emit(Op::Jump(0));
+            // exception path
+            self.patch(setup);
+            self.handler_entry(base_stack, boundary);
+            let exc = self.declare_local("(with exc)", false)?;
+            self.emit(Op::SetLocal(exc));
+            self.emit(Op::GetLocal(slot));
+            let classof = self.globals.slot("$classof");
+            self.emit(Op::GetGlobal(classof));
+            self.emit(Op::GetLocal(exc));
+            self.emit(Op::Call(1));
+            self.emit(Op::GetLocal(exc));
+            self.emit(Op::None);
+            self.emit(Op::Invoke(sym::D_EXIT, 3));
+            let swallowed = self.emit(Op::JumpIfTrue(0));
+            self.emit(Op::GetLocal(exc));
+            self.emit(Op::Raise);
+            self.patch(swallowed);
+            self.patch(done);
+        }
+        self.end_scope();
+        Ok(())
+    }
+
+    /// del x; del d[k]; del xs[1:3]; del obj.attr; (comma-separated)
+    fn del_stmt(&mut self) -> Res<()> {
+        self.advance(); // del
+        loop {
+            let plain = match (self.peek(), &self.toks[self.pos + 1].tok) {
+                (Tok::Ident(n), Tok::Comma | Tok::Semi) => Some(n.clone()),
+                _ => None,
+            };
+            if let Some(name) = plain {
+                self.advance();
+                self.del_name(&name)?;
+            } else {
+                self.del_mode = true;
+                let done = self.parse_postfix(false);
+                self.del_mode = false;
+                if !done? {
+                    return Err(self.error_prev(
+                        "can only delete names, items (x[i], x[a:b]) and attributes (x.name)",
+                    ));
+                }
+            }
+            if !self.matches(&Tok::Comma) {
+                break;
+            }
+        }
+        self.expect(Tok::Semi, "expected ';' after del")
+    }
+
+    fn del_name(&mut self, name: &str) -> Res<()> {
+        let global_decl = self.cur().global_decls.contains(name);
+        let fi = self.fns.len() - 1;
+        if !global_decl && (self.resolve_local(name).is_some() || self.resolve_upvalue(fi, name).is_some()) {
+            return Err(self.error_prev(&format!(
+                "can't delete local variable '{}' (assign None to it instead)",
+                name
+            )));
+        }
+        let g = self.globals.slot(name);
+        if self.globals.is_const[g as usize] {
+            return Err(self.error_prev(&format!("cannot delete constant '{}'", name)));
+        }
+        self.emit(Op::DelGlobal(g));
+        Ok(())
+    }
+
+    /// `super().name(args)` inside a method: `Base.name(self, args)`.
+    fn super_call(&mut self) -> Res<bool> {
+        let (is_method, base) = (self.cur().is_method, self.cur().class_base);
+        let base = match (is_method, base) {
+            (true, Some(b)) => b,
+            (true, None) => {
+                return Err(self.error_prev("super() needs a base class: class Child(Parent) { ... }"))
+            }
+            _ => return Err(self.error_prev("super() can only be used directly inside a method")),
+        };
+        self.expect(Tok::LParen, "expected '(' after super")?;
+        self.expect(Tok::RParen, "super() takes no arguments in Faston")?;
+        self.expect(Tok::Dot, "expected '.' after super(): super().method(...)")?;
+        let mname = self.expect_ident("expected a method name after 'super().'")?;
+        // the base-class expression, re-parsed here
+        let resume = self.pos;
+        self.pos = base.0;
+        self.expression()?;
+        if self.pos != base.1 {
+            return Err(self.error("unexpected token in base class"));
+        }
+        self.pos = resume;
+        let n = self.name_const(&mname);
+        self.emit(Op::GetAttr(n));
+        if !self.check(&Tok::LParen) {
+            return Err(self.error("super() can only call a method: super().name(...)"));
+        }
+        if self.args_have_splat_after_paren() {
+            return Err(self.error("super() calls with * or ** arguments aren't supported yet"));
+        }
+        self.advance(); // (
+        self.emit(Op::GetLocal(0)); // self
+        match self.arguments()? {
+            CallArgs::Plain(argc) => self.emit(Op::Call(argc + 1)),
+            CallArgs::Keywords(argc, k) => self.emit(Op::CallKw(argc + 1, k)),
+            CallArgs::Splat => unreachable!(),
+        };
+        Ok(false)
     }
 
     fn block(&mut self) -> Res<()> {
@@ -1387,8 +1743,10 @@ impl<'g> Compiler<'g> {
         while self.cur().active.len() > depth {
             let h = self.f().active.pop().unwrap();
             self.emit(Op::PopTry);
-            if let Some(range) = h {
-                self.block_at(range)?;
+            match h {
+                Cleanup::Handler => {}
+                Cleanup::Finally(range) => self.block_at(range)?,
+                Cleanup::With(slot) => self.emit_with_exit(slot),
             }
         }
         self.f().active = saved;
@@ -1492,14 +1850,14 @@ impl<'g> Compiler<'g> {
         let fin_setup = match finally {
             Some(range) => {
                 let j = self.emit(Op::SetupTry(0));
-                self.f().active.push(Some(range));
+                self.f().active.push(Cleanup::Finally(range));
                 Some(j)
             }
             None => None,
         };
         let exc_setup = if has_except {
             let j = self.emit(Op::SetupTry(0));
-            self.f().active.push(None);
+            self.f().active.push(Cleanup::Handler);
             Some(j)
         } else {
             None
@@ -1527,7 +1885,7 @@ impl<'g> Compiler<'g> {
             self.patch(j);
             self.handler_entry(base_stack, boundary);
             if let Some(range) = finally {
-                self.f().active.push(Some(range));
+                self.f().active.push(Cleanup::Finally(range));
             }
             self.begin_scope();
             let exc_slot = self.declare_local("(exc)", false)?;
@@ -1571,7 +1929,7 @@ impl<'g> Compiler<'g> {
                     self.emit(Op::PopTry);
                     self.f().active.pop();
                     self.block_at(range)?;
-                    self.f().active.push(Some(range));
+                    self.f().active.push(Cleanup::Finally(range));
                 }
                 end_jumps.push(self.emit(Op::Jump(0)));
                 if let Some(j) = next {
@@ -1673,6 +2031,9 @@ impl<'g> Compiler<'g> {
 
     /// Full expression, including `a if cond else b`.
     fn expression(&mut self) -> Res<()> {
+        if self.check(&Tok::Yield) {
+            return self.yield_expr();
+        }
         let start_pos = self.pos;
         let prev_label = self.cur().last_label;
         let code_len = self.label(); // lets us discard `a` if it turns out to be a ternary
@@ -1752,6 +2113,11 @@ impl<'g> Compiler<'g> {
                 self.advance();
                 (Op::In, true)
             }
+            Tok::Is if self.toks[self.pos + 1].tok == Tok::Not => {
+                self.advance();
+                (Op::Is, true)
+            }
+            Tok::Is => (Op::Is, false),
             _ => return None,
         };
         self.advance();
@@ -1772,7 +2138,7 @@ impl<'g> Compiler<'g> {
             self.parse_bitor(false)?;
             let is_chain = matches!(
                 self.peek(),
-                Tok::EqEq | Tok::NotEq | Tok::Lt | Tok::Le | Tok::Gt | Tok::Ge | Tok::In
+                Tok::EqEq | Tok::NotEq | Tok::Lt | Tok::Le | Tok::Gt | Tok::Ge | Tok::In | Tok::Is
             ) || (self.check(&Tok::Not) && self.toks[self.pos + 1].tok == Tok::In);
             if is_chain {
                 // [a, b] -> [b, a, b] -> [b, a<b]; stop early (keeping b below) if false.
@@ -1909,9 +2275,12 @@ impl<'g> Compiler<'g> {
     }
 
     fn parse_postfix(&mut self, can_assign: bool) -> Res<bool> {
+        // a `del` target: only this level's last accessor deletes (nested expressions read)
+        let del = std::mem::replace(&mut self.del_mode, false);
         if self.primary(can_assign)? {
             return Ok(true);
         }
+        let del_end = |c: &Self| del && matches!(c.peek(), Tok::Comma | Tok::Semi);
         loop {
             match self.peek() {
                 Tok::LParen => {
@@ -1973,6 +2342,9 @@ impl<'g> Compiler<'g> {
                         }
                         self.emit(Op::SetAttr(n));
                         return Ok(true);
+                    } else if del_end(self) {
+                        self.emit(Op::DelAttr(n));
+                        return Ok(true);
                     } else {
                         self.emit(Op::GetAttr(n));
                     }
@@ -2001,10 +2373,27 @@ impl<'g> Compiler<'g> {
                             self.emit(Op::None);
                         }
                         self.expect(Tok::RBracket, "expected ']' after slice")?;
+                        if del_end(self) {
+                            self.emit(Op::DelSlice);
+                            return Ok(true);
+                        }
+                        if can_assign && self.check(&Tok::Assign) {
+                            self.advance();
+                            self.expression()?;
+                            self.emit(Op::SetSlice);
+                            return Ok(true);
+                        }
+                        if can_assign && assign_kind(self.peek()).is_some() {
+                            return Err(self.error("augmented assignment to a slice isn't supported"));
+                        }
                         self.emit(Op::GetSlice);
                         continue;
                     }
                     self.expect(Tok::RBracket, "expected ']' after index")?;
+                    if del_end(self) {
+                        self.emit(Op::DelIndex);
+                        return Ok(true);
+                    }
                     if let (true, Some(kind)) = (can_assign, assign_kind(self.peek())) {
                         self.advance();
                         if let Some(op) = kind {
@@ -2246,6 +2635,9 @@ impl<'g> Compiler<'g> {
     }
 
     fn variable(&mut self, name: String, can_assign: bool) -> Res<bool> {
+        if name == "super" && self.check(&Tok::LParen) && self.resolve_local("super").is_none() {
+            return self.super_call();
+        }
         let global_decl = self.cur().global_decls.contains(&name);
         let local = if global_decl {
             None

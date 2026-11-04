@@ -36,6 +36,42 @@ pub struct HandleType {
     pub repr: fn(&Handle) -> String,
 }
 
+/// A generator (a suspended call of a function containing `yield`), or the
+/// iterator `iter(sequence)` returns.
+pub struct Generator {
+    pub kind: GenKind,
+    pub state: u8,
+}
+
+pub enum GenKind {
+    Frame {
+        /// The function or closure being run.
+        owner: Gc,
+        /// Its stack slots (locals, then operand stack) while suspended.
+        saved: Vec<Value>,
+        /// Instruction index to resume at.
+        ip: usize,
+        /// Active `try` blocks: (stack height relative to the frame base, handler target).
+        handlers: Vec<(usize, u32)>,
+    },
+    Seq {
+        items: Value,
+        idx: usize,
+    },
+    /// An object with `__next__` (Python's iterator protocol): call it until it
+    /// raises StopIteration.
+    Next {
+        obj: Value,
+    },
+}
+
+pub mod gen_state {
+    pub const CREATED: u8 = 0;
+    pub const SUSPENDED: u8 = 1;
+    pub const RUNNING: u8 = 2;
+    pub const DONE: u8 = 3;
+}
+
 impl Handle {
     pub fn get<T: 'static>(&self) -> Option<&T> {
         self.data.downcast_ref::<T>()
@@ -87,6 +123,7 @@ pub mod kind {
     pub const TUPLE: u8 = 12;
     pub const SET: u8 = 13;
     pub const HANDLE: u8 = 14;
+    pub const GENERATOR: u8 = 15;
 }
 
 impl Obj {
@@ -107,6 +144,7 @@ impl Obj {
             Obj::Tuple(_) => kind::TUPLE,
             Obj::Set(_) => kind::SET,
             Obj::Handle(_) => kind::HANDLE,
+            Obj::Generator(_) => kind::GENERATOR,
         }
     }
 }
@@ -197,6 +235,7 @@ pub enum Obj {
     Set(Box<Dict>),
     /// Native resource (file, GUI object, ...).
     Handle(Box<Handle>),
+    Generator(Box<Generator>),
 }
 
 /// A function together with the variables it captured from enclosing functions.
@@ -737,6 +776,16 @@ impl Heap {
                 }
                 // An open upvalue's variable is on the stack (already a root).
                 Obj::Upvalue(u) => self.mark(u.closed),
+                Obj::Generator(gen) => match &gen.kind {
+                    GenKind::Frame { owner, saved, .. } => {
+                        self.mark_gc(*owner);
+                        for v in saved.iter() {
+                            self.mark(*v);
+                        }
+                    }
+                    GenKind::Seq { items, .. } => self.mark(*items),
+                    GenKind::Next { obj } => self.mark(*obj),
+                },
                 Obj::Module(_) => {}
                 Obj::Tuple(t) => {
                     for x in t.iter() {
@@ -883,7 +932,7 @@ pub fn to_key(v: Value) -> Result<Key, String> {
         Value::Obj(g) => match g.get() {
             Obj::Str(_) => Key::Str(g),
             Obj::Func(_) | Obj::Native(_) | Obj::Class(_) | Obj::Instance(_) | Obj::Closure(_)
-            | Obj::Module(_) | Obj::Handle(_) => Key::Ptr(g.addr()),
+            | Obj::Module(_) | Obj::Handle(_) | Obj::Generator(_) => Key::Ptr(g.addr()),
             Obj::Tuple(t) => {
                 for x in t.iter() {
                     to_key(*x)?;
@@ -979,6 +1028,10 @@ impl Value {
                 Obj::Upvalue(_) => "upvalue".into(),
                 Obj::Module(_) => "module".into(),
                 Obj::Handle(h) => h.ty.name.into(),
+                Obj::Generator(gen) => match gen.kind {
+                    GenKind::Frame { .. } => "generator".into(),
+                    GenKind::Seq { .. } | GenKind::Next { .. } => "iterator".into(),
+                },
             },
         }
     }
@@ -1139,6 +1192,12 @@ impl Value {
                     let _ = write!(out, "<module '{}'>", m.name);
                 }
                 Obj::Handle(h) => out.push_str(&(h.ty.repr)(h)),
+                Obj::Generator(gen) => match &gen.kind {
+                    GenKind::Frame { owner, .. } => {
+                        let _ = write!(out, "<generator object {}>", callable_name(*owner));
+                    }
+                    GenKind::Seq { .. } | GenKind::Next { .. } => out.push_str("<iterator object>"),
+                },
             },
         }
     }

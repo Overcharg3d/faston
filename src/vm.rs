@@ -117,6 +117,96 @@ fn dunder(v: Value, name: u32) -> Option<Value> {
     }
 }
 
+/// `a is b`: the same object (or the same immediate value).
+pub fn same_object(a: Value, b: Value) -> bool {
+    match (a, b) {
+        (Value::None, Value::None) | (Value::Undef, Value::Undef) => true,
+        (Value::Bool(x), Value::Bool(y)) => x == y,
+        (Value::Int(x), Value::Int(y)) => x == y,
+        (Value::Float(x), Value::Float(y)) => x.to_bits() == y.to_bits(),
+        (Value::Obj(x), Value::Obj(y)) => x == y,
+        _ => false,
+    }
+}
+
+fn slice_bound(v: Value) -> Result<Option<i64>, String> {
+    match v {
+        Value::None => Ok(None),
+        Value::Int(i) => Ok(Some(i)),
+        Value::Bool(b) => Ok(Some(b as i64)),
+        _ => Err("TypeError: slice indices must be integers or None".into()),
+    }
+}
+
+/// `list[a:b:c] = items` (Some) or `del list[a:b:c]` (None), with Python's rules.
+fn slice_assign(obj: Value, start: Value, stop: Value, step: Value, items: Option<Vec<Value>>) -> Result<(), String> {
+    let l = match obj {
+        Value::Obj(g) => match g.get_mut() {
+            Obj::List(l) => l,
+            _ => {
+                return Err(format!(
+                    "TypeError: '{}' object does not support slice {}",
+                    obj.type_name(),
+                    if items.is_some() { "assignment" } else { "deletion" }
+                ))
+            }
+        },
+        _ => return Err(format!("TypeError: '{}' object is not subscriptable", obj.type_name())),
+    };
+    let len = l.len() as i64;
+    let step = slice_bound(step)?.unwrap_or(1);
+    if step == 0 {
+        return Err("ValueError: slice step cannot be zero".into());
+    }
+    let (lower, upper) = if step < 0 { (-1, len - 1) } else { (0, len) };
+    let norm = |v: Option<i64>, default: i64| match v {
+        None => default,
+        Some(i) if i < 0 => (i + len).max(lower),
+        Some(i) => i.min(upper),
+    };
+    let start = norm(slice_bound(start)?, if step < 0 { upper } else { lower });
+    let stop = norm(slice_bound(stop)?, if step < 0 { lower } else { upper });
+    if step == 1 {
+        let (a, b) = (start as usize, stop.max(start) as usize);
+        match items {
+            Some(new) => {
+                l.splice(a..b, new);
+            }
+            None => {
+                l.drain(a..b);
+            }
+        }
+        return Ok(());
+    }
+    let mut idxs = Vec::new();
+    let mut i = start;
+    while (step > 0 && i < stop) || (step < 0 && i > stop) {
+        idxs.push(i as usize);
+        i += step;
+    }
+    match items {
+        Some(new) => {
+            if new.len() != idxs.len() {
+                return Err(format!(
+                    "ValueError: attempt to assign sequence of size {} to extended slice of size {}",
+                    new.len(),
+                    idxs.len()
+                ));
+            }
+            for (k, &i) in idxs.iter().enumerate() {
+                l[i] = new[k];
+            }
+        }
+        None => {
+            idxs.sort_unstable();
+            for &i in idxs.iter().rev() {
+                l.remove(i);
+            }
+        }
+    }
+    Ok(())
+}
+
 #[inline(always)]
 fn is_instance(v: &Value) -> bool {
     matches!(v, Value::Obj(g) if matches!(g.get(), Obj::Instance(_)))
@@ -170,6 +260,22 @@ class JSONDecodeError(ValueError) { pass; }
 class SyntaxError(Exception) { pass; }
 class StopIteration(Exception) { pass; }
 class KeyboardInterrupt(BaseException) { pass; }
+class GeneratorExit(BaseException) { pass; }
+class property {
+    def init(self, fget = None, fset = None, fdel = None, doc = None) {
+        self.fget = fget; self.fset = fset; self.fdel = fdel; self.__doc__ = doc;
+    }
+    def getter(self, f) { return property(f, self.fset, self.fdel, self.__doc__); }
+    def setter(self, f) { return property(self.fget, f, self.fdel, self.__doc__); }
+    def deleter(self, f) { return property(self.fget, self.fset, f, self.__doc__); }
+}
+class staticmethod {
+    def init(self, f) { self.__func__ = f; }
+    def __call__(self, *args, **kwargs) { return self.__func__(*args, **kwargs); }
+}
+class classmethod {
+    def init(self, f) { self.__func__ = f; }
+}
 "#;
 
 impl Frame {
@@ -239,6 +345,10 @@ pub struct Vm {
     pub open_files: Vec<std::rc::Weak<std::cell::RefCell<crate::fileio::Stream>>>,
     /// Command-line arguments for `sys.argv` (argv[0] is the script).
     pub argv: Vec<String>,
+    /// Generators currently running, innermost last (`yield` suspends the top one).
+    gen_stack: Vec<Gc>,
+    /// Prelude classes the VM treats specially: property, staticmethod, classmethod.
+    descriptors: Option<[Gc; 3]>,
 }
 
 impl Default for Vm {
@@ -293,6 +403,8 @@ impl Vm {
             bundle: None,
             open_files: Vec::new(),
             argv: Vec::new(),
+            gen_stack: Vec::new(),
+            descriptors: None,
         };
         vm.stack_ptr = vm.stack.as_mut_ptr();
         if compiled {
@@ -326,6 +438,83 @@ impl Vm {
             self.builtin_values[g] = v;
         }
         self.base_exception = self.builtin_class("BaseException");
+        if let (Some(p), Some(s), Some(c)) =
+            (self.builtin_class("property"), self.builtin_class("staticmethod"), self.builtin_class("classmethod"))
+        {
+            self.descriptors = Some([p, s, c]);
+        }
+    }
+
+    /// For a value found on a class: 0 = property, 1 = staticmethod, 2 = classmethod
+    /// (with the wrapper object), or None for an ordinary method / attribute.
+    fn descriptor(&self, v: Value) -> Option<(u8, Gc)> {
+        let d = self.descriptors?;
+        if let Value::Obj(g) = v {
+            if let Obj::Instance(i) = g.get() {
+                for (k, c) in d.iter().enumerate() {
+                    if i.class == *c {
+                        return Some((k as u8, g));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// A field of a prelude object (None when unset).
+    fn field_of(&mut self, g: Gc, name: &str) -> Value {
+        let s = self.syms.intern(name);
+        match g.get() {
+            Obj::Instance(i) => match i.class.as_class().slots.get(&s).and_then(|&sl| i.fields.get(sl as usize)) {
+                Some(Value::Undef) | None => Value::None,
+                Some(&v) => v,
+            },
+            _ => Value::None,
+        }
+    }
+
+    /// `obj.name` where class `cls` provides `m` (no instance field of that name):
+    /// properties run their getter, static methods unwrap, class methods bind the
+    /// class, and plain functions bind `obj`.
+    fn class_member_for(&mut self, obj: Value, cls: Gc, name: u32, m: Value) -> Result<Value, String> {
+        match self.descriptor(m) {
+            Some((0, p)) => {
+                let fget = self.field_of(p, "fget");
+                if matches!(fget, Value::None) {
+                    return Err(format!("AttributeError: property '{}' has no getter", self.syms.name(name)));
+                }
+                self.call(fget, &[obj])
+            }
+            Some((1, s)) => Ok(self.field_of(s, "__func__")),
+            Some((_, c)) => {
+                let f = self.field_of(c, "__func__");
+                self.bind(Value::Obj(cls), f)
+            }
+            None => self.bind(obj, m),
+        }
+    }
+
+    /// A bound method for bytecode functions; anything else as is.
+    fn bind(&mut self, recv: Value, m: Value) -> Result<Value, String> {
+        match m {
+            Value::Obj(f) if f.as_callable().is_some() => {
+                Ok(Value::Obj(self.heap.alloc(Obj::Bound(Bound { recv, method: f }))))
+            }
+            other => Ok(other),
+        }
+    }
+
+    /// `Class.name`: static methods unwrap and class methods bind the class;
+    /// properties and plain functions come back as they are.
+    fn class_attr_on_class(&mut self, cls: Gc, m: Value) -> Result<Value, String> {
+        match self.descriptor(m) {
+            Some((1, s)) => Ok(self.field_of(s, "__func__")),
+            Some((2, c)) => {
+                let f = self.field_of(c, "__func__");
+                self.bind(Value::Obj(cls), f)
+            }
+            _ => Ok(m),
+        }
     }
 
     fn builtin_class(&self, name: &str) -> Option<Gc> {
@@ -641,6 +830,17 @@ impl Vm {
         if let Some(m) = dunder(container, sym::D_CONTAINS) {
             return Ok(self.call(m, &[container, item])?.truthy());
         }
+        if let Value::Obj(g) = container {
+            if matches!(g.get(), Obj::Generator(_)) {
+                // consumes items up to the first match, like Python
+                while let Some(x) = self.resume_gen(g, Value::None)? {
+                    if self.compare(CmpOp::Eq, item, x)? {
+                        return Ok(true);
+                    }
+                }
+                return Ok(false);
+            }
+        }
         if dunder(item, sym::D_EQ).is_some() {
             if let Value::Obj(g) = container {
                 let items: Option<Vec<Value>> = match g.get() {
@@ -773,12 +973,25 @@ impl Vm {
 
     /// Items of any iterable, including instances with `__iter__`.
     pub fn to_vec(&mut self, v: Value) -> Result<Vec<Value>, String> {
+        if let Value::Obj(g) = v {
+            if matches!(g.get(), Obj::Generator(_)) {
+                return self.drain_gen(g);
+            }
+        }
+        if dunder(v, sym::D_NEXT).is_some() {
+            let it = self.make_iter(v)?;
+            return self.to_vec(it);
+        }
         if let Some(m) = dunder(v, sym::D_ITER) {
             let it = self.call(m, &[v])?;
             if is_instance(&it) {
-                return Err("TypeError: __iter__ must return a list, tuple or other built-in iterable".into());
+                if dunder(it, sym::D_NEXT).is_some() {
+                    let it = self.make_iter(it)?;
+                    return self.to_vec(it);
+                }
+                return Err("TypeError: __iter__ must return an iterable or an iterator (an object with __next__)".into());
             }
-            return ops::to_vec(&mut self.heap, it);
+            return self.to_vec(it);
         }
         if let Some(items) = self.handle_iter(v)? {
             return ops::to_vec(&mut self.heap, items);
@@ -975,6 +1188,196 @@ impl Vm {
         }
         self.sp = callee;
         r
+    }
+
+    // ------------------------------------------------------------------ generators
+
+    /// Runs generator `g` until its next `yield` (Some(value)) or until it finishes
+    /// (None). `send` is the value the paused `yield` expression evaluates to.
+    pub fn resume_gen(&mut self, g: Gc, send: Value) -> Result<Option<Value>, String> {
+        let gen = match g.get_mut() {
+            Obj::Generator(x) => x,
+            _ => return Err("TypeError: not a generator".into()),
+        };
+        match gen.state {
+            gen_state::DONE => return Ok(None),
+            gen_state::RUNNING => return Err("ValueError: generator already executing".into()),
+            _ => {}
+        }
+        let (owner, saved, resume_at, hs) = match &mut gen.kind {
+            GenKind::Seq { items, idx } => {
+                let next = match *items {
+                    Value::Obj(o) => match o.get() {
+                        Obj::List(l) => l.get(*idx).copied(),
+                        Obj::Tuple(t) => t.get(*idx).copied(),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                *idx += 1;
+                if next.is_none() {
+                    gen.state = gen_state::DONE;
+                }
+                return Ok(next);
+            }
+            GenKind::Next { obj } => {
+                let obj = *obj;
+                gen.state = gen_state::RUNNING;
+                let r = match dunder(obj, sym::D_NEXT) {
+                    Some(m) => self.call(m, &[obj]),
+                    None => Err(format!("TypeError: '{}' object is not an iterator", obj.type_name())),
+                };
+                let gen = match g.get_mut() {
+                    Obj::Generator(x) => x,
+                    _ => unreachable!(),
+                };
+                return match r {
+                    Ok(v) => {
+                        gen.state = gen_state::SUSPENDED;
+                        Ok(Some(v))
+                    }
+                    Err(e) if e.starts_with("StopIteration") => {
+                        gen.state = gen_state::DONE;
+                        self.exc = None;
+                        Ok(None)
+                    }
+                    Err(e) => {
+                        gen.state = gen_state::DONE;
+                        Err(e)
+                    }
+                };
+            }
+            GenKind::Frame { owner, saved, ip, handlers } => {
+                (*owner, std::mem::take(saved), *ip, std::mem::take(handlers))
+            }
+        };
+        let was_suspended = gen.state == gen_state::SUSPENDED;
+        if !was_suspended && !matches!(send, Value::None) {
+            if let GenKind::Frame { saved: s, handlers: h, .. } = &mut gen.kind {
+                *s = saved;
+                *h = hs;
+            }
+            return Err("TypeError: can't send non-None value to a just-started generator".into());
+        }
+        let (fobj, upvals) = owner.as_callable().expect("generator owner is callable");
+        let f = fobj.as_func();
+        let base = self.sp;
+        if self.frames.len() >= MAX_FRAMES || base + saved.len() + f.max_stack as usize + 2 >= STACK_SLOTS {
+            if let GenKind::Frame { saved: s, handlers: h, .. } = &mut gen.kind {
+                *s = saved;
+                *h = hs;
+            }
+            return Err("RecursionError: maximum recursion depth exceeded".into());
+        }
+        for (i, v) in saved.iter().enumerate() {
+            self.stack[base + i] = *v;
+        }
+        let mut sp = base + saved.len();
+        if was_suspended {
+            self.stack[sp] = send;
+            sp += 1;
+        }
+        self.sp = sp;
+        gen.state = gen_state::RUNNING;
+        let globals = self.unit_globals(f.unit);
+        self.frames.push(Frame {
+            owner,
+            code: f.code.as_ptr(),
+            consts: f.consts.as_ptr(),
+            ip: unsafe { f.code.as_ptr().add(resume_at) },
+            base,
+            ret: base,
+            upvals,
+            globals,
+        });
+        let depth = self.frames.len();
+        for (off, target) in hs {
+            self.handlers.push(Handler { frames: depth, sp: base + off, target });
+        }
+        self.gen_stack.push(g);
+        let r = self.interp();
+        self.gen_stack.pop();
+        let gen = match g.get_mut() {
+            Obj::Generator(x) => x,
+            _ => unreachable!(),
+        };
+        let out = match r {
+            Ok(v) if gen.state == gen_state::SUSPENDED => Ok(Some(v)),
+            Ok(_) => {
+                // returned: the generator is exhausted
+                gen.state = gen_state::DONE;
+                Ok(None)
+            }
+            Err(e) => {
+                gen.state = gen_state::DONE;
+                self.close_upvalues(base);
+                self.frames.truncate(depth - 1);
+                while self.handlers.last().is_some_and(|h| h.frames >= depth) {
+                    self.handlers.pop();
+                }
+                Err(e)
+            }
+        };
+        self.sp = base;
+        out
+    }
+
+    /// An iterator over `v`: generators are their own iterators; objects with
+    /// `__next__` are wrapped; anything else iterable becomes a sequence iterator.
+    pub fn make_iter(&mut self, v: Value) -> Result<Value, String> {
+        if let Value::Obj(g) = v {
+            if matches!(g.get(), Obj::Generator(_)) {
+                return Ok(v);
+            }
+        }
+        if dunder(v, sym::D_NEXT).is_some() {
+            return Ok(Value::Obj(self.heap.alloc(Obj::Generator(Box::new(Generator {
+                kind: GenKind::Next { obj: v },
+                state: gen_state::SUSPENDED,
+            })))));
+        }
+        if let Some(m) = dunder(v, sym::D_ITER) {
+            let it = self.call(m, &[v])?;
+            if dunder(it, sym::D_NEXT).is_some() || matches!(it, Value::Obj(g) if matches!(g.get(), Obj::Generator(_))) {
+                return self.make_iter(it);
+            }
+        }
+        let items = self.to_vec(v)?;
+        let list = self.heap.list(items);
+        Ok(Value::Obj(self.heap.alloc(Obj::Generator(Box::new(Generator {
+            kind: GenKind::Seq { items: list, idx: 0 },
+            state: gen_state::SUSPENDED,
+        })))))
+    }
+
+    /// Every remaining item of generator / iterator `g`.
+    fn drain_gen(&mut self, g: Gc) -> Result<Vec<Value>, String> {
+        let list = self.heap.list(Vec::new());
+        let mark = self.temp_mark();
+        self.push_temp(list)?;
+        self.push_temp(Value::Obj(g))?;
+        let r = loop {
+            match self.resume_gen(g, Value::None) {
+                Ok(Some(x)) => {
+                    if let Value::Obj(l) = list {
+                        if let Obj::List(items) = l.get_mut() {
+                            items.push(x);
+                        }
+                    }
+                }
+                Ok(None) => break Ok(()),
+                Err(e) => break Err(e),
+            }
+        };
+        self.temp_reset(mark);
+        r?;
+        Ok(match list {
+            Value::Obj(l) => match l.get() {
+                Obj::List(items) => items.clone(),
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        })
     }
 
     /// Keeps `v` alive across `call`s by parking it on the VM stack (for built-ins).
@@ -1439,7 +1842,8 @@ impl Vm {
                             Ok(true)
                         }
                         Some(m) => {
-                            self.stack[recv] = m;
+                            let v = self.class_member_for(rv, inst.class, name, m)?;
+                            self.stack[recv] = v;
                             self.call_value_kw(recv, npos, kws)
                         }
                         None => Err(format!(
@@ -1626,7 +2030,8 @@ impl Vm {
                             Ok(true)
                         }
                         Some(m) => {
-                            self.stack[recv] = m;
+                            let v = self.class_member_for(rv, inst.class, name, m)?;
+                            self.stack[recv] = v;
                             self.call_value(recv, argc)
                         }
                         _ => Err(format!(
@@ -1644,7 +2049,8 @@ impl Vm {
                 Obj::Class(c) => {
                     return match c.method(name) {
                         Some(m) => {
-                            self.stack[recv] = m;
+                            let v = self.class_attr_on_class(g, m)?;
+                            self.stack[recv] = v;
                             self.call_value(recv, argc)
                         }
                         None => Err(format!(
@@ -1687,6 +2093,23 @@ impl Vm {
     #[inline(never)]
     fn store_attr(&mut self, obj: Value, name: u32, v: Value) -> Result<Option<(u32, u32)>, String> {
         if let Value::Obj(g) = obj {
+            // a property on the class takes the assignment
+            if let Obj::Instance(inst) = g.get() {
+                if let Some(m) = inst.class.as_class().method(name) {
+                    if let Some((0, p)) = self.descriptor(m) {
+                        let fset = self.field_of(p, "fset");
+                        if matches!(fset, Value::None) {
+                            return Err(format!(
+                                "AttributeError: property '{}' of '{}' object has no setter",
+                                self.syms.name(name),
+                                obj.type_name()
+                            ));
+                        }
+                        self.call(fset, &[obj, v])?;
+                        return Ok(None);
+                    }
+                }
+            }
             match g.get_mut() {
                 Obj::Instance(inst) => {
                     let cls = inst.class.as_class_mut();
@@ -1697,6 +2120,15 @@ impl Vm {
                     }
                     inst.fields[s] = v;
                     return Ok(Some((cls.id, slot)));
+                }
+                // Class.attr = v: a class attribute (also replaces a method)
+                Obj::Class(c) => {
+                    let existed = c.methods.contains_key(&name);
+                    c.set_method(name, v);
+                    if !existed {
+                        c.id = self.heap.new_class_id();
+                    }
+                    return Ok(None);
                 }
                 Obj::Module(m) => {
                     // Modules can't grow new globals at runtime (frames hold pointers
@@ -1720,6 +2152,70 @@ impl Vm {
             }
         }
         Err(self.set_attr_error(obj, name))
+    }
+
+    /// `del obj[idx]`
+    fn del_index(&mut self, obj: Value, idx: Value) -> Result<(), String> {
+        if let Some(m) = dunder(obj, sym::D_DELITEM) {
+            self.call(m, &[obj, idx])?;
+            return Ok(());
+        }
+        if let Value::Obj(g) = obj {
+            match g.get_mut() {
+                Obj::List(l) => {
+                    let i = match idx {
+                        Value::Int(i) => i,
+                        Value::Bool(b) => b as i64,
+                        _ => return Err(format!("TypeError: list indices must be integers, not '{}'", idx.type_name())),
+                    };
+                    let n = l.len() as i64;
+                    let j = if i < 0 { i + n } else { i };
+                    if j < 0 || j >= n {
+                        return Err("IndexError: list assignment index out of range".into());
+                    }
+                    l.remove(j as usize);
+                    return Ok(());
+                }
+                Obj::Dict(d) => {
+                    let k = to_key(idx)?;
+                    return match d.remove(&k) {
+                        Some(_) => Ok(()),
+                        None => Err(format!("KeyError: {}", idx.repr())),
+                    };
+                }
+                _ => {}
+            }
+        }
+        Err(format!("TypeError: '{}' object doesn't support item deletion", obj.type_name()))
+    }
+
+    /// `del obj.name`
+    fn del_attr(&mut self, obj: Value, name: u32) -> Result<(), String> {
+        if let Value::Obj(g) = obj {
+            if let Obj::Instance(inst) = g.get_mut() {
+                let cls = inst.class.as_class_mut();
+                if let Some(&slot) = cls.slots.get(&name) {
+                    if let Some(f) = inst.fields.get_mut(slot as usize) {
+                        if !matches!(f, Value::Undef) {
+                            *f = Value::Undef;
+                            // cached field reads must re-check
+                            cls.id = self.heap.new_class_id();
+                            return Ok(());
+                        }
+                    }
+                }
+                return Err(format!(
+                    "AttributeError: '{}' object has no attribute '{}'",
+                    cls.name,
+                    self.syms.name(name)
+                ));
+            }
+        }
+        Err(format!(
+            "AttributeError: cannot delete attribute '{}' of '{}' object",
+            self.syms.name(name),
+            obj.type_name()
+        ))
     }
 
     fn module_slot(&mut self, unit: u32, name: u32) -> Option<u32> {
@@ -1804,7 +2300,7 @@ impl Vm {
                         Some(Value::Obj(m)) if m.as_callable().is_some() => Ok(Value::Obj(
                             self.heap.alloc(Obj::Bound(Bound { recv: obj, method: m })),
                         )),
-                        Some(other) => Ok(other),
+                        Some(other) => self.class_member_for(obj, inst.class, name, other),
                         _ => Err(format!(
                             "AttributeError: '{}' object has no attribute '{}'",
                             cls.name,
@@ -1821,13 +2317,14 @@ impl Vm {
                     }
                 }
                 Obj::Class(c) => {
-                    return c.method(name).ok_or_else(|| {
-                        format!(
-                            "AttributeError: class '{}' has no method '{}'",
+                    return match c.method(name) {
+                        Some(m) => self.class_attr_on_class(g, m),
+                        None => Err(format!(
+                            "AttributeError: class '{}' has no attribute '{}'",
                             c.name,
                             self.syms.name(name)
-                        )
-                    })
+                        )),
+                    };
                 }
                 _ => {}
             }
@@ -1868,11 +2365,20 @@ impl Vm {
                     let items = ops::to_vec(&mut self.heap, v)?;
                     return Ok((self.heap.list(items), Value::Int(0), Value::None));
                 }
+                Obj::Generator(_) => return Ok((v, Value::Int(0), Value::None)),
                 Obj::Instance(_) => {
+                    if dunder(v, sym::D_NEXT).is_some() {
+                        let it = self.make_iter(v)?;
+                        return Ok((it, Value::Int(0), Value::None));
+                    }
                     if let Some(m) = dunder(v, sym::D_ITER) {
                         let it = self.call(m, &[v])?;
                         if is_instance(&it) {
-                            return Err("TypeError: __iter__ must return a list, tuple or other built-in iterable".into());
+                            if dunder(it, sym::D_NEXT).is_some() {
+                                let it = self.make_iter(it)?;
+                                return Ok((it, Value::Int(0), Value::None));
+                            }
+                            return Err("TypeError: __iter__ must return an iterable or an iterator (an object with __next__)".into());
                         }
                         return self.get_iter_state(it);
                     }
@@ -2294,6 +2800,43 @@ impl Vm {
                 }
                 self.sp -= n + 1;
                 self.spush(Value::Bool(hit));
+            }
+            Op::Is => {
+                let b = self.spop();
+                let a = self.spop();
+                self.spush(Value::Bool(same_object(a, b)));
+            }
+            Op::DelIndex => {
+                let (obj, idx) = (self.stack[self.sp - 2], self.stack[self.sp - 1]);
+                self.del_index(obj, idx)?;
+                self.sp -= 2;
+            }
+            Op::DelAttr(n) => {
+                let obj = self.stack[self.sp - 1];
+                self.del_attr(obj, n)?;
+                self.sp -= 1;
+            }
+            Op::DelGlobal(g) => {
+                let globals = self.frames.last().unwrap().globals;
+                let slot = unsafe { &mut *globals.add(g as usize) };
+                if matches!(*slot, Value::Undef) {
+                    return Err(self.name_error(g));
+                }
+                *slot = Value::Undef;
+            }
+            Op::SetSlice => {
+                let s = self.sp;
+                let (obj, start, stop, step, v) =
+                    (self.stack[s - 5], self.stack[s - 4], self.stack[s - 3], self.stack[s - 2], self.stack[s - 1]);
+                let items = self.to_vec(v)?;
+                slice_assign(obj, start, stop, step, Some(items))?;
+                self.sp -= 5;
+            }
+            Op::DelSlice => {
+                let s = self.sp;
+                let (obj, start, stop, step) = (self.stack[s - 4], self.stack[s - 3], self.stack[s - 2], self.stack[s - 1]);
+                slice_assign(obj, start, stop, step, None)?;
+                self.sp -= 4;
             }
             other => unreachable!("{:?} is handled in the main loop", other),
         }
@@ -2986,12 +3529,20 @@ impl Vm {
                             jump_to!(exit);
                         }
                     }
-                    // list state: [list, Int(index), -]
+                    // list state: [list, Int(index), -]; generator state: [gen, -, -]
                     Value::Obj(g) => {
                         let idx = as_int!(*local!(s + 1)) as usize;
                         let next = match g.get() {
                             Obj::List(l) => l.get(idx).copied(),
                             Obj::Tuple(t) => t.get(idx).copied(),
+                            Obj::Generator(_) => {
+                                self.sp = sp;
+                                save_ip!();
+                                match self.resume_gen(g, Value::None) {
+                                    Ok(v) => v,
+                                    Err(e) => throw!(e),
+                                }
+                            }
                             _ => None,
                         };
                         match next {
@@ -3022,6 +3573,14 @@ impl Vm {
                             let next = match g.get() {
                                 Obj::List(l) => l.get(idx).copied(),
                                 Obj::Tuple(t) => t.get(idx).copied(),
+                                Obj::Generator(_) => {
+                                    self.sp = sp;
+                                    save_ip!();
+                                    match self.resume_gen(g, Value::None) {
+                                        Ok(v) => v,
+                                        Err(e) => throw!(e),
+                                    }
+                                }
                                 _ => None,
                             };
                             match next {
@@ -3155,6 +3714,60 @@ impl Vm {
                         return Ok(result);
                     }
                     push!(result);
+                    reload!();
+                }
+                // A generator function was called: package the frame (its arguments are
+                // already in its locals) into a generator object and return that.
+                Op::Gen => {
+                    let fr = self.frames.pop().unwrap();
+                    let n = fr.func().as_func().num_locals as usize;
+                    let saved = self.stack[fr.base..fr.base + n].to_vec();
+                    let resume_at = unsafe { ip.offset_from(code) } as usize;
+                    let g = self.heap.alloc(Obj::Generator(Box::new(Generator {
+                        kind: GenKind::Frame { owner: fr.owner, saved, ip: resume_at, handlers: Vec::new() },
+                        state: gen_state::CREATED,
+                    })));
+                    sp = fr.ret;
+                    if self.frames.len() == stop {
+                        self.sp = sp;
+                        return Ok(Value::Obj(g));
+                    }
+                    push!(Value::Obj(g));
+                    reload!();
+                }
+                // Suspend the running generator: save its frame (slots, ip, try blocks)
+                // into the generator object and hand the value to `resume_gen`.
+                Op::Yield => {
+                    let v = pop!();
+                    let g = match self.gen_stack.last() {
+                        Some(&g) => g,
+                        None => throw!("RuntimeError: 'yield' outside of a running generator".to_string()),
+                    };
+                    let depth = self.frames.len();
+                    let fr = self.frames.pop().unwrap();
+                    // Closures made inside the generator keep their own copy from here on.
+                    if !self.open_upvals.is_empty() {
+                        self.close_upvalues(fr.base);
+                    }
+                    let saved = self.stack[fr.base..sp].to_vec();
+                    let resume_at = unsafe { ip.offset_from(code) } as usize;
+                    let mut hs = Vec::new();
+                    while self.handlers.last().is_some_and(|h| h.frames == depth) {
+                        let h = self.handlers.pop().unwrap();
+                        hs.push((h.sp - fr.base, h.target));
+                    }
+                    hs.reverse();
+                    if let Obj::Generator(gen) = g.get_mut() {
+                        gen.kind = GenKind::Frame { owner: fr.owner, saved, ip: resume_at, handlers: hs };
+                        gen.state = gen_state::SUSPENDED;
+                    }
+                    sp = fr.ret;
+                    if self.frames.len() == stop {
+                        self.sp = sp;
+                        return Ok(v);
+                    }
+                    // (not reached: generator frames are only entered by resume_gen)
+                    push!(v);
                     reload!();
                 }
 
