@@ -69,15 +69,30 @@ class Project {
     attach(an) {
         const memo = new Map();
         an.getModule = (name) => {
-            if (!an.uri || an.uri.scheme !== 'file' || !/^[\p{L}_][\p{L}\p{N}_]*$/u.test(name)) return null;
+            if (!an.uri || an.uri.scheme !== 'file' || !/^[\p{L}_][\p{L}\p{N}_]*(\.[\p{L}_][\p{L}\p{N}_]*)*$/u.test(name)) return null;
             const now = Date.now();
             const m = memo.get(name);
             if (m && now - m.at < 1500) return m.an;
-            const p = path.join(path.dirname(an.uri.fsPath), name + '.fst');
-            const r = this.key(vscode.Uri.file(p)) === this.key(an.uri) ? an : this.forPath(p);
+            const found = resolveModule(an.uri.fsPath, name);
+            let r = null;
+            if (found && found.file) {
+                r = this.key(vscode.Uri.file(found.file)) === this.key(an.uri) ? an : this.forPath(found.file);
+            } else if (found) {
+                r = this.namespace(found.dir);
+            }
             memo.set(name, { at: now, an: r });
             return r;
         };
+    }
+    /** A package directory without __init__.fst: an empty module. */
+    namespace(dir) {
+        const k = 'ns:' + this.key(vscode.Uri.file(dir));
+        const c = this.cache.get(k);
+        if (c) return c.an;
+        const an = new A.Analysis('', vscode.Uri.file(path.join(dir, '__init__.fst')));
+        this.attach(an);
+        this.cache.set(k, { stamp: 'ns', an });
+        return an;
     }
     async workspaceFiles(limit = 3000) {
         const uris = await vscode.workspace.findFiles('**/*.fst', '{**/target/**,**/node_modules/**,**/.git/**}', limit);
@@ -116,21 +131,89 @@ function location(an, s, e) {
 function fileLabel(an) {
     return an.uri ? path.basename(an.uri.fsPath || an.uri.path) : '';
 }
+/** Where `import` looks (like the runtime's sys.path): the file's directory, the
+ * project root (faston.toml), its .faston/packages, then FASTON_PATH. */
+function searchDirs(fromFile) {
+    const dirs = [path.dirname(fromFile)];
+    // inside a package: the folder holding the top-level package (where the
+    // main script usually is) is on sys.path when the program runs
+    let pkg = path.dirname(fromFile);
+    while (fs.existsSync(path.join(pkg, '__init__.fst')) && path.dirname(pkg) !== pkg) pkg = path.dirname(pkg);
+    if (pkg !== path.dirname(fromFile)) dirs.push(pkg);
+    let d = path.dirname(fromFile);
+    for (let i = 0; i < 40; i++) {
+        if (fs.existsSync(path.join(d, 'faston.toml'))) {
+            dirs.push(d);
+            const pk = path.join(d, '.faston', 'packages');
+            if (fs.existsSync(pk)) dirs.push(pk);
+            break;
+        }
+        const up = path.dirname(d);
+        if (up === d) break;
+        d = up;
+    }
+    for (const p of (process.env.FASTON_PATH || '').split(path.delimiter)) if (p) dirs.push(p);
+    return [...new Set(dirs)];
+}
+
+function findIn(dirs, part) {
+    for (const d of dirs) {
+        const pkg = path.join(d, part);
+        const init = path.join(pkg, '__init__.fst');
+        if (fs.existsSync(init)) return { file: init, dir: pkg, pkg: true };
+        const file = path.join(d, part + '.fst');
+        if (fs.existsSync(file)) return { file, dir: d, pkg: false };
+    }
+    for (const d of dirs) {
+        const pkg = path.join(d, part);
+        try {
+            if (fs.statSync(pkg).isDirectory()) return { file: null, dir: pkg, pkg: true };
+        } catch { /* not there */ }
+    }
+    return null;
+}
+
+/** The file (or package directory) a possibly dotted module name refers to. */
+function resolveModule(fromFile, name) {
+    const parts = name.split('.');
+    let dirs = searchDirs(fromFile);
+    let found = null;
+    for (let i = 0; i < parts.length; i++) {
+        found = findIn(dirs, parts[i]);
+        if (!found) return null;
+        if (i < parts.length - 1) {
+            if (!found.pkg) return null;
+            dirs = [found.dir];
+        }
+    }
+    return found;
+}
+
 function moduleFile(an, name) {
     if (!an.uri || an.uri.scheme !== 'file') return null;
-    const p = path.join(path.dirname(an.uri.fsPath), name + '.fst');
-    return fs.existsSync(p) ? p : null;
+    const f = resolveModule(an.uri.fsPath, name);
+    return f && f.file ? f.file : null;
 }
+
+/** Modules and packages importable from this file (for completion). */
 function siblingModules(an) {
     if (!an.uri || an.uri.scheme !== 'file') return [];
-    try {
-        const self = path.basename(an.uri.fsPath);
-        return fs.readdirSync(path.dirname(an.uri.fsPath))
-            .filter((f) => f.endsWith('.fst') && f !== self && /^[\p{L}_][\p{L}\p{N}_]*\.fst$/u.test(f))
-            .map((f) => f.slice(0, -4));
-    } catch {
-        return [];
+    const out = new Set();
+    const self = path.basename(an.uri.fsPath);
+    for (const d of searchDirs(an.uri.fsPath)) {
+        try {
+            for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+                if (e.isFile() && e.name.endsWith('.fst') && e.name !== self && e.name !== '__init__.fst' && /^[\p{L}_][\p{L}\p{N}_]*\.fst$/u.test(e.name)) {
+                    out.add(e.name.slice(0, -4));
+                } else if (e.isDirectory() && /^[\p{L}_][\p{L}\p{N}_]*$/u.test(e.name) && !e.name.startsWith('_') && e.name !== 'target' && e.name !== 'node_modules') {
+                    try {
+                        if (fs.readdirSync(path.join(d, e.name)).some((f) => f.endsWith('.fst'))) out.add(e.name);
+                    } catch { /* unreadable */ }
+                }
+            }
+        } catch { /* missing dir */ }
     }
+    return [...out];
 }
 function lastTokenBefore(grp, offset) {
     let lo = 0, hi = grp.length - 1, r = -1;
@@ -417,7 +500,7 @@ const completionProvider = {
         if (first && first.t === 'kw' && first.v === 'from' && grp === an.tokens) {
             const importIdx = grp.slice(st, k + 1).findIndex((t) => t.t === 'kw' && t.v === 'import');
             if (importIdx < 0) return k === st ? moduleItems(an) : undefined;
-            const modName = grp[st + 1] && grp[st + 1].v;
+            const modName = grp.slice(st + 1, st + importIdx).map((t) => t.v).join('');
             const type = BI.MODULES[modName] ? { t: 'module', builtin: modName } : (() => {
                 const m = an.getModule && an.getModule(modName);
                 return m ? { t: 'module', an: m } : null;

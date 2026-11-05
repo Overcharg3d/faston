@@ -29,14 +29,16 @@ function isIdPart(c) {
 /** Finds the end (index after the closing quote) of a string starting at `i` (the quote). */
 function scanString(text, i) {
     const q = text[i];
-    let k = i + 1;
+    const triple = text[i + 1] === q && text[i + 2] === q;
+    const ql = triple ? 3 : 1;
+    let k = i + ql;
     while (k < text.length) {
         const c = text[k];
         if (c === '\\') { k += 2; continue; }
-        if (c === q) return { end: k + 1, unterminated: false };
+        if (c === q && (!triple || (text[k + 1] === q && text[k + 2] === q))) return { end: k + ql, unterminated: false, ql };
         k++;
     }
-    return { end: text.length, unterminated: true };
+    return { end: text.length, unterminated: true, ql };
 }
 
 /**
@@ -71,12 +73,12 @@ function lex(text, base = 0) {
             continue;
         }
         if ((c === 'f' || c === 'F') && (text[i + 1] === '"' || text[i + 1] === "'")) {
-            const { end, unterminated } = scanString(text, i + 1);
+            const { end, unterminated, ql } = scanString(text, i + 1);
             const tok = { t: 'fstr', v: text.slice(i, end), s: base + i, e: base + end, unterminated };
             tokens.push(tok);
             // interpolations: {expr} or {expr:spec}; {{ and }} are literal braces
-            const contentStart = i + 2;
-            const contentEnd = unterminated ? end : end - 1;
+            const contentStart = i + 1 + ql;
+            const contentEnd = unterminated ? end : end - ql;
             let k = contentStart;
             while (k < contentEnd) {
                 const ch = text[k];
@@ -103,6 +105,13 @@ function lex(text, base = 0) {
                 }
                 k++;
             }
+            i = end;
+            continue;
+        }
+        if ((c === 'r' || c === 'R') && (text[i + 1] === '"' || text[i + 1] === "'")) {
+            // raw string: scanString's backslash rule matches Python's raw strings
+            const { end, unterminated } = scanString(text, i + 1);
+            tokens.push({ t: 'str', v: text.slice(i, end), s: base + i, e: base + end, unterminated });
             i = end;
             continue;
         }
@@ -505,40 +514,56 @@ class Analysis {
                         continue;
                     }
                     case 'import': {
+                        // import a, b.c, d.e as f;
                         let j = i + 1;
                         while (T[j] && T[j].t === 'id') {
-                            const modTok = T[j];
-                            let nameTok = modTok;
-                            if (T[j + 1] && T[j + 1].v === 'as' && T[j + 2] && T[j + 2].t === 'id') {
-                                nameTok = T[j + 2];
+                            const d = this.dotted(T, j);
+                            j = d.next;
+                            if (T[j] && T[j].v === 'as' && T[j + 1] && T[j + 1].t === 'id') {
+                                // the dotted name only names a module here
+                                for (const t of d.toks) {
+                                    t.skip = true;
+                                    t.modPrefix = d.prefixes.get(t);
+                                }
+                                const nameTok = T[j + 1];
+                                this.define(scope, { name: nameTok.v, kind: 'module', tok: nameTok, module: d.name, modTok: d.toks[d.toks.length - 1] });
                                 j += 2;
+                            } else {
+                                // `import a.b` binds `a`; `.b` resolves as a submodule
+                                const first = d.toks[0];
+                                this.define(scope, { name: first.v, kind: 'module', tok: first, module: first.v, modTok: first });
                             }
-                            this.define(scope, { name: nameTok.v, kind: 'module', tok: nameTok, module: modTok.v, modTok });
-                            this.imports.push({ module: modTok.v, tok: modTok, names: null });
-                            if (T[j + 1] && T[j + 1].v === ',') j += 2; else { j++; break; }
+                            this.imports.push({ module: d.name, tok: d.toks[0], toks: d.toks, names: null });
+                            if (T[j] && T[j].v === ',') j += 1; else break;
                         }
-                        i = j - 1;
+                        i = j;
                         continue;
                     }
                     case 'from': {
-                        const modTok = T[i + 1];
-                        if (!modTok || modTok.t !== 'id' || !T[i + 2] || T[i + 2].v !== 'import') break;
-                        modTok.skip = true;
-                        let j = i + 3;
-                        const entry = { module: modTok.v, tok: modTok, names: [] };
+                        // from a.b import c, d as e;
+                        if (!T[i + 1] || T[i + 1].t !== 'id') break;
+                        const d = this.dotted(T, i + 1);
+                        if (!T[d.next] || T[d.next].v !== 'import') break;
+                        for (const t of d.toks) {
+                            t.skip = true;
+                            t.modPrefix = d.prefixes.get(t);
+                        }
+                        const modName = d.name;
+                        let j = d.next + 1;
+                        const entry = { module: modName, tok: d.toks[0], toks: d.toks, names: [] };
                         this.imports.push(entry);
                         while (T[j] && T[j].t === 'id') {
                             const orig = T[j];
                             let nameTok = orig;
                             if (T[j + 1] && T[j + 1].v === 'as' && T[j + 2] && T[j + 2].t === 'id') {
                                 orig.skip = true;
-                                orig.importOf = { module: modTok.v, name: orig.v };
+                                orig.importOf = { module: modName, name: orig.v };
                                 nameTok = T[j + 2];
                                 j += 2;
                             }
                             entry.names.push({ name: orig.v, tok: orig });
                             this.define(scope, {
-                                name: nameTok.v, kind: 'import', tok: nameTok, module: modTok.v, imported: orig.v,
+                                name: nameTok.v, kind: 'import', tok: nameTok, module: modName, imported: orig.v,
                             });
                             if (T[j + 1] && T[j + 1].v === ',') j += 2; else { j++; break; }
                         }
@@ -640,6 +665,21 @@ class Analysis {
                 }
             }
         }
+    }
+
+    /** A dotted module name starting at token `j`: { name, toks, prefixes (tok -> "a.b"), next }. */
+    dotted(T, j) {
+        const toks = [T[j]];
+        const prefixes = new Map([[T[j], T[j].v]]);
+        let name = T[j].v;
+        j++;
+        while (T[j] && T[j].v === '.' && T[j + 1] && T[j + 1].t === 'id') {
+            name += '.' + T[j + 1].v;
+            toks.push(T[j + 1]);
+            prefixes.set(T[j + 1], name);
+            j += 2;
+        }
+        return { name, toks, prefixes, next: j };
     }
 
     /** Index of the last token of an expression starting at `k` (stops at , ; or an unmatched closer). */
@@ -783,6 +823,11 @@ function typeOfEntity(ent, depth = 0) {
     switch (ent.kind) {
         case 'builtinFn': return { t: 'function' };
         case 'exception': return { t: 'exceptionClass', name: ent.name };
+        case 'moduleRef': {
+            if (BI.MODULES[ent.name]) return { t: 'module', builtin: ent.name };
+            const mod = ent.an.getModule && ent.an.getModule(ent.name);
+            return mod ? { t: 'module', an: mod, name: ent.name, importer: ent.an } : null;
+        }
         case 'moduleMember': {
             const m = BI.MODULES[ent.module].members[ent.name];
             if (m && m.module) return { t: 'module', builtin: m.module };
@@ -796,7 +841,7 @@ function typeOfEntity(ent, depth = 0) {
                 case 'module': {
                     if (BI.MODULES[sym.module]) return { t: 'module', builtin: sym.module };
                     const mod = an.getModule && an.getModule(sym.module);
-                    return mod ? { t: 'module', an: mod, name: sym.module } : null;
+                    return mod ? { t: 'module', an: mod, name: sym.module, importer: an } : null;
                 }
                 case 'function':
                 case 'method':
@@ -854,6 +899,10 @@ function instanceOf(ent) {
     }
     if (ent.kind === 'method') {
         const m = BI.METHODS[ent.type][ent.name];
+        return m && m.returns ? { t: 'builtin', name: m.returns } : null;
+    }
+    if (ent.kind === 'moduleMember') {
+        const m = BI.MODULES[ent.module].members[ent.name];
         return m && m.returns ? { t: 'builtin', name: m.returns } : null;
     }
     return null;
@@ -914,7 +963,14 @@ function members(type, depth = 0) {
 
 function memberEntity(type, name, depth = 0) {
     const m = members(type, depth);
-    return (m && m.get(name)) || null;
+    const found = m && m.get(name);
+    if (found) return found;
+    // a submodule of a package: `game.enemies`
+    if (type && type.t === 'module' && type.name && type.importer && type.importer.getModule) {
+        const full = type.name + '.' + name;
+        if (type.importer.getModule(full)) return { kind: 'moduleRef', name: full, an: type.importer };
+    }
+    return null;
 }
 
 /** Type of the expression ending just before token grp[dotIdx] (a '.'). */
@@ -954,12 +1010,13 @@ function entityOfIdent(an, grp, idx, depth = 0) {
         const target = mod && mod.module.get(t.v);
         return target ? followSym(mod, target) : null;
     }
+    // a part of a module name in `from a.b import ...` / `import a.b as c`
+    if (t.modPrefix) {
+        if (BI.MODULES[t.modPrefix]) return { kind: 'moduleRef', name: t.modPrefix, an, builtin: true };
+        return { kind: 'moduleRef', name: t.modPrefix, an };
+    }
     const prev = grp[idx - 1];
     if (prev && prev.v === '.') return memberEntity(typeBefore(an, grp, idx - 1, depth + 1), t.v, depth + 1);
-    // the module name in `from m import ...`
-    if (t.skip && grp[idx + 1] && grp[idx + 1].v === 'import') {
-        return { kind: 'moduleRef', name: t.v, an };
-    }
     // a module name in `import a, b;`
     const sym = an.lookup(t.v, t.s);
     if (sym && sym.kind === 'module' && sym.modTok === t) return { kind: 'symbol', an, sym };

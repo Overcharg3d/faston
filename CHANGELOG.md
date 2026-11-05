@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.0
+
+- Packages: dotted imports (`import game.enemies;`, `from a.b import c as d;`)
+  resolve like the runtime does: next to the file, the project root
+  (`faston.toml`), `.faston/packages`, and `FASTON_PATH`; go to definition,
+  hover and completion work through them
+- The new modules `re`, `collections`, `datetime`, `subprocess` and `sys.path`
+- Raw strings (`r"\d+"`)
+
 ## 0.2.0
 
 - New syntax: `is`, `del`, `with`, `yield`, decorators (`@property`, ...)
