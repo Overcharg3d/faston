@@ -9,8 +9,9 @@ use std::path::{Component, Path, PathBuf};
 /// Where module files come from.
 pub enum Source<'a> {
     Disk,
-    /// A built executable: sources keyed by normalized relative path.
-    Bundle(&'a HashMap<String, String>),
+    /// A built executable: text files and binary files (bytecode), keyed by
+    /// normalized relative path.
+    Bundle(&'a HashMap<String, String>, &'a HashMap<String, Vec<u8>>),
 }
 
 /// A module that `find` located.
@@ -75,11 +76,11 @@ impl Source<'_> {
                     None
                 }
             }
-            Source::Bundle(b) => b.get(&norm(p)).cloned(),
+            Source::Bundle(b, _) => b.get(&norm(p)).cloned(),
         }
     }
 
-    /// A binary file (bytecode); bundles keep these in `bundle::BINARY_PREFIX` entries.
+    /// A binary file (bytecode).
     fn read_bytes(&self, p: &Path) -> Option<Vec<u8>> {
         match self {
             Source::Disk => {
@@ -89,19 +90,25 @@ impl Source<'_> {
                     None
                 }
             }
-            Source::Bundle(b) => {
-                let hex = b.get(&format!("{}{}", crate::bundle::BINARY_PREFIX, norm(p)))?;
-                crate::bundle::unhex(hex)
-            }
+            Source::Bundle(_, bin) => bin.get(&norm(p)).cloned(),
+        }
+    }
+
+    /// How a compiled module is named in tracebacks: in a built program it is
+    /// the .fst it was compiled from.
+    fn compiled_ext(&self) -> &'static str {
+        match self {
+            Source::Disk => "fbc",
+            Source::Bundle(..) => "fst",
         }
     }
 
     fn is_dir(&self, p: &Path) -> bool {
         match self {
             Source::Disk => p.is_dir(),
-            Source::Bundle(b) => {
+            Source::Bundle(b, bin) => {
                 let prefix = format!("{}/", norm(p));
-                prefix != "/" && b.keys().any(|k| k.starts_with(&prefix))
+                prefix != "/" && (b.keys().any(|k| k.starts_with(&prefix)) || bin.keys().any(|k| k.starts_with(&prefix)))
             }
         }
     }
@@ -109,7 +116,7 @@ impl Source<'_> {
     fn key(&self, p: &Path) -> String {
         match self {
             Source::Disk => canon(p).display().to_string(),
-            Source::Bundle(_) => norm(p),
+            Source::Bundle(..) => norm(p),
         }
     }
 }
@@ -131,6 +138,17 @@ pub fn find(source: &Source, name: &str, dirs: &[PathBuf]) -> Option<Found> {
                 bytecode: None,
             });
         }
+        let init_fbc = pkg.join("__init__.fbc");
+        if let Some(code) = source.read_bytes(&init_fbc) {
+            return Some(Found {
+                key: source.key(&init_fbc),
+                src: String::new(),
+                display: format!("{}/__init__.{}", name, source.compiled_ext()),
+                dir: pkg,
+                package: true,
+                bytecode: Some(code),
+            });
+        }
         let file = d.join(format!("{}.fst", name));
         if let Some(src) = source.read(&file) {
             return Some(Found {
@@ -148,7 +166,7 @@ pub fn find(source: &Source, name: &str, dirs: &[PathBuf]) -> Option<Found> {
             return Some(Found {
                 key: source.key(&fbc),
                 src: String::new(),
-                display: format!("{}.fbc", name),
+                display: format!("{}.{}", name, source.compiled_ext()),
                 dir: d.clone(),
                 package: false,
                 bytecode: Some(code),

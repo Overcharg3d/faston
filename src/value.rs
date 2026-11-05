@@ -1565,3 +1565,25 @@ pub fn write_bytes_repr(out: &mut String, b: &[u8]) {
     }
     out.push(q as char);
 }
+
+/// Global variable table of one module, shared by every compilation run of it
+/// (so the REPL works).
+#[derive(Default, Clone)]
+pub struct Globals {
+    pub index: std::collections::HashMap<String, u32>,
+    pub names: Vec<String>,
+    pub is_const: Vec<bool>,
+}
+
+impl Globals {
+    pub fn slot(&mut self, name: &str) -> u32 {
+        if let Some(&i) = self.index.get(name) {
+            return i;
+        }
+        let i = self.names.len() as u32;
+        self.index.insert(name.to_string(), i);
+        self.names.push(name.to_string());
+        self.is_const.push(false);
+        i
+    }
+}

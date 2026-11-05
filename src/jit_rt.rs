@@ -557,6 +557,13 @@ impl std::hash::Hasher for Fnv {
     }
 }
 
+pub(super) fn hash_bytes(b: &[u8]) -> u64 {
+    use std::hash::Hasher;
+    let mut h = Fnv::new();
+    h.write(b);
+    h.finish()
+}
+
 pub(super) fn hash_str(s: &str) -> u64 {
     use std::hash::Hasher;
     let mut h = Fnv::new();
@@ -753,11 +760,11 @@ impl Aot {
 }
 
 impl Vm {
-    /// Attaches saved machine code to the functions of a module just compiled
-    /// from `src` (whose top-level function is `script`).
-    pub(super) fn install_aot(&mut self, src: &str, script: Gc) {
+    /// Attaches saved machine code to the functions of a module just loaded
+    /// from bytecode `data` (whose top-level function is `script`).
+    pub(super) fn install_aot(&mut self, data: &[u8], script: Gc) {
         let Some(aot) = self.aot.take() else { return };
-        if let Some(saved) = aot.units.get(&hash_str(src)) {
+        if let Some(saved) = aot.units.get(&hash_bytes(data)) {
             let funcs = unit_funcs(script);
             let before = self.aot_count;
             if funcs.len() == saved.len() {

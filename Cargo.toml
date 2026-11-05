@@ -9,13 +9,16 @@ name = "faston"
 path = "src/main.rs"
 
 [features]
-default = ["gui", "jit"]
+default = ["gui", "jit", "compiler"]
 # The `gui` module (windows, widgets, a drawing canvas).
 gui = ["dep:eframe", "dep:image", "dep:winit"]
 # The native code generator (Cranelift): `faston run --native` and `faston build`.
 # Without it you get a runtime for built programs (faston-rt): it runs the
 # machine code `faston build` saved in them, and interprets everything else.
-jit = ["dep:cranelift-codegen", "dep:cranelift-frontend", "dep:cranelift-jit", "dep:cranelift-module", "dep:cranelift-native"]
+# The built-in Rust compiler (stage 0). The toolchain uses compiler.fbc (the
+# Faston compiler) when it finds one; runtimes for built programs have neither.
+compiler = []
+jit = ["compiler", "dep:cranelift-codegen", "dep:cranelift-frontend", "dep:cranelift-jit", "dep:cranelift-module", "dep:cranelift-native"]
 
 [dependencies]
 cranelift-codegen = { version = "0.137.0", optional = true }

@@ -1,25 +1,39 @@
-//! `faston build`: a standalone executable is this program's own binary with the
-//! Faston sources (the main file and every module it imports) appended. When it
-//! starts it finds them, compiles them to machine code and runs them; no Faston
-//! installation, interpreter or C toolchain is needed on the target machine.
+//! `faston build`: a standalone executable is a Faston runtime with the program
+//! appended: the bytecode of the main file and of every module it imports, and
+//! (for the small runtimes) their machine code. No source and no compiler go
+//! into it; it needs no Faston installation, interpreter or C toolchain.
 
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
+#[cfg(feature = "compiler")]
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "compiler")]
 use crate::lexer::{self, Tok};
+#[cfg(feature = "compiler")]
 use crate::vm::Vm;
 
-const MAGIC: &[u8; 8] = b"FSTNBND1";
+const MAGIC: &[u8; 8] = b"FSTNBND2";
 
 pub struct Bundle {
     pub main_name: String,
-    pub main_src: String,
+    /// Text entries (metadata such as `sys.path`).
     pub modules: HashMap<String, String>,
+    /// Bytecode: the main module (`MAIN_KEY`) and every module, by path (`x.fbc`).
+    pub binary: HashMap<String, Vec<u8>>,
     /// Machine code compiled at build time, for runtimes without a code generator.
     pub aot: Option<Vec<u8>>,
 }
+
+/// Binary entry holding the main module's bytecode.
+pub const MAIN_KEY: &str = "\0main";
+/// Name prefix of binary entries in the file.
+const BIN: &str = "\0b:";
+/// Entry holding the program's machine code.
+pub const AOT_KEY: &str = "\0aot";
+/// Entry holding the program's `sys.path` (relative, one per line).
+pub const PATH_KEY: &str = "\0path";
 
 /// The program bundled into the running executable, if any.
 pub fn embedded() -> Option<Bundle> {
@@ -56,20 +70,23 @@ fn decode(data: &[u8]) -> Option<Bundle> {
     };
     let text = |b: &[u8]| std::str::from_utf8(b).ok().map(str::to_string);
     let main_name = text(next()?)?;
-    let main_src = text(next()?)?;
     let mut modules = HashMap::new();
+    let mut binary = HashMap::new();
     let mut aot: Option<Vec<u8>> = None;
     while let Some(name) = next() {
         let body = next()?;
         if name == AOT_KEY.as_bytes() {
             aot = Some(body.to_vec());
+        } else if let Some(rest) = name.strip_prefix(BIN.as_bytes()) {
+            binary.insert(text(rest)?, body.to_vec());
         } else {
             modules.insert(text(name)?, text(body)?);
         }
     }
-    Some(Bundle { main_name, main_src, modules, aot })
+    Some(Bundle { main_name, modules, binary, aot })
 }
 
+#[cfg(feature = "compiler")]
 fn encode(b: &Bundle) -> Vec<u8> {
     let mut out = Vec::new();
     let mut put = |s: &[u8]| {
@@ -77,12 +94,17 @@ fn encode(b: &Bundle) -> Vec<u8> {
         out.extend_from_slice(s);
     };
     put(b.main_name.as_bytes());
-    put(b.main_src.as_bytes());
     let mut names: Vec<&String> = b.modules.keys().collect();
     names.sort();
     for n in names {
         put(n.as_bytes());
         put(b.modules[n].as_bytes());
+    }
+    let mut names: Vec<&String> = b.binary.keys().collect();
+    names.sort();
+    for n in names {
+        put(format!("{}{}", BIN, n).as_bytes());
+        put(&b.binary[n]);
     }
     if let Some(a) = &b.aot {
         put(AOT_KEY.as_bytes());
@@ -91,34 +113,8 @@ fn encode(b: &Bundle) -> Vec<u8> {
     out
 }
 
-/// Prefix of bundle entries holding binary module files (bytecode), hex-encoded.
-pub const BINARY_PREFIX: &str = "\0bin:";
-
-fn hex(b: &[u8]) -> String {
-    let mut s = String::with_capacity(b.len() * 2);
-    for x in b {
-        s.push_str(&format!("{:02x}", x));
-    }
-    s
-}
-
-pub fn unhex(s: &str) -> Option<Vec<u8>> {
-    let b = s.as_bytes();
-    if b.len() % 2 != 0 {
-        return None;
-    }
-    b.chunks(2)
-        .map(|p| u8::from_str_radix(std::str::from_utf8(p).ok()?, 16).ok())
-        .collect()
-}
-
-/// Bundle entry holding the program's machine code (binary).
-pub const AOT_KEY: &str = "\0aot";
-
-/// Bundle entry holding the program's `sys.path` (relative, one per line).
-pub const PATH_KEY: &str = "\0path";
-
 /// Reads a dotted module name starting at token `j`; returns it and the next index.
+#[cfg(feature = "compiler")]
 fn dotted(toks: &[lexer::Token], mut j: usize) -> Option<(String, usize)> {
     let mut name = match toks.get(j).map(|t| &t.tok) {
         Some(Tok::Ident(n)) => n.clone(),
@@ -139,6 +135,7 @@ fn dotted(toks: &[lexer::Token], mut j: usize) -> Option<(String, usize)> {
 }
 
 /// Module names (possibly dotted) a source file imports.
+#[cfg(feature = "compiler")]
 fn imports(src: &str) -> Vec<String> {
     let toks = match lexer::lex(src) {
         Ok(t) => t,
@@ -191,18 +188,28 @@ fn imports(src: &str) -> Vec<String> {
     out
 }
 
-/// Every module file the program can import, found the way `faston run` finds
-/// them, keyed by path relative to the main file's directory.
-fn collect(main_dir: &Path, src: &str, vm: &mut Vm) -> HashMap<String, String> {
+/// What a program imports, found the way `faston run` finds it: module sources
+/// (keyed by path relative to the main file's directory), compiled modules
+/// (.fbc files), and the relative `sys.path`.
+#[cfg(feature = "compiler")]
+struct Collected {
+    sources: Vec<(String, String)>,
+    compiled: HashMap<String, Vec<u8>>,
+    path: String,
+}
+
+#[cfg(feature = "compiler")]
+fn collect(main_dir: &Path, src: &str, vm: &mut Vm) -> Collected {
     let base = crate::modules::canon(main_dir);
     let search = crate::modules::default_path(&base);
-    let mut modules: HashMap<String, String> = HashMap::new();
+    let mut sources: Vec<(String, String)> = Vec::new();
+    let mut compiled: HashMap<String, Vec<u8>> = HashMap::new();
     let mut seen_files: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut todo: Vec<(PathBuf, String)> = vec![(base.clone(), src.to_string())];
     while let Some((dir, s)) = todo.pop() {
         for name in imports(&s) {
             let first = name.split('.').next().unwrap_or("");
-            if vm.module(first).is_some() || crate::stdlib::source(first).is_some() {
+            if vm.module(first).is_some() || crate::stdlib::is_module(first) {
                 continue;
             }
             let mut dirs = vec![dir.clone()];
@@ -212,20 +219,16 @@ fn collect(main_dir: &Path, src: &str, vm: &mut Vm) -> HashMap<String, String> {
                     Some(f) => f,
                     None => break, // a missing module fails at run time, as usual
                 };
+                let key = crate::modules::relative(&base, &PathBuf::from(&found.key));
                 if let Some(code) = &found.bytecode {
-                    // a compiled module: stored as hex (its own imports must be
-                    // found at run time, or be bundled through other imports)
-                    let key = crate::modules::relative(&base, &PathBuf::from(&found.key));
+                    // a compiled module (its own imports must be found at run time,
+                    // or come along through other imports)
                     if seen_files.insert(key.clone()) {
-                        modules.insert(format!("{}{}", BINARY_PREFIX, key), hex(code));
+                        compiled.insert(key, code.clone());
                     }
-                } else if !found.src.is_empty() || found.display.ends_with(".fst") {
-                    let file = PathBuf::from(&found.key);
-                    let key = crate::modules::relative(&base, &file);
-                    if seen_files.insert(key.clone()) {
-                        modules.insert(key, found.src.clone());
-                        todo.push((found.dir.clone(), found.src.clone()));
-                    }
+                } else if (!found.src.is_empty() || found.display.ends_with(".fst")) && seen_files.insert(key.clone()) {
+                    sources.push((key, found.src.clone()));
+                    todo.push((found.dir.clone(), found.src.clone()));
                 }
                 if !found.package {
                     break;
@@ -234,16 +237,17 @@ fn collect(main_dir: &Path, src: &str, vm: &mut Vm) -> HashMap<String, String> {
             }
         }
     }
+    sources.sort();
     let rel: Vec<String> = search
         .iter()
         .map(|d| crate::modules::relative(&base, &crate::modules::canon(d)))
         .map(|r| if r.is_empty() { ".".to_string() } else { r })
         .collect();
-    modules.insert(PATH_KEY.to_string(), rel.join("\n"));
-    modules
+    Collected { sources, compiled, path: rel.join("\n") }
 }
 
 /// The runtime a built program starts from.
+#[cfg(feature = "compiler")]
 struct Runtime {
     path: PathBuf,
     /// `faston-rt` / `faston-rt-gui`: no code generator, so the program's machine
@@ -254,7 +258,8 @@ struct Runtime {
 
 /// `faston-rt` (or `faston-rt-gui` for programs that use the gui module) next
 /// to this executable; without them, this executable itself (which compiles the
-/// program when it starts).
+/// program's bytecode to machine code when it starts).
+#[cfg(feature = "compiler")]
 fn runtime(want_gui: bool) -> Option<Runtime> {
     let me = std::env::current_exe().ok()?;
     let _ = want_gui;
@@ -274,6 +279,7 @@ fn runtime(want_gui: bool) -> Option<Runtime> {
 }
 
 /// The standard-library modules (written in Faston) the program can import.
+#[cfg(feature = "compiler")]
 fn stdlib_imports<'a>(sources: impl Iterator<Item = &'a str>) -> Vec<String> {
     let mut found: Vec<String> = Vec::new();
     let mut todo: Vec<&str> = sources.collect();
@@ -293,6 +299,7 @@ fn stdlib_imports<'a>(sources: impl Iterator<Item = &'a str>) -> Vec<String> {
 }
 
 /// Builds `path` into a native executable. Returns the process exit code.
+#[cfg(feature = "compiler")]
 pub fn build(path: &str, out: Option<&str>, force_gui: bool) -> i32 {
     let src = match fs::read_to_string(path) {
         Ok(s) => s,
@@ -309,10 +316,8 @@ pub fn build(path: &str, out: Option<&str>, force_gui: bool) -> i32 {
     let main_name = p.file_name().map_or(path.to_string(), |n| n.to_string_lossy().into_owned());
 
     // the imported modules (and packages), found exactly like `faston run` would
-    let modules = collect(&dir, &src, &mut Vm::new());
-    let sources = || {
-        std::iter::once(src.as_str()).chain(modules.iter().filter(|(k, _)| !k.starts_with('\0')).map(|(_, v)| v.as_str()))
-    };
+    let found = collect(&dir, &src, &mut Vm::new());
+    let sources = || std::iter::once(src.as_str()).chain(found.sources.iter().map(|(_, s)| s.as_str()));
     let uses_gui = sources().any(|s| imports(s).iter().any(|n| n == "gui" || n.starts_with("gui.")));
     if uses_gui && !cfg!(feature = "gui") {
         eprintln!("faston: warning: this program imports gui, but this faston was built without it");
@@ -325,28 +330,57 @@ pub fn build(path: &str, out: Option<&str>, force_gui: bool) -> i32 {
         }
     };
 
-    // compile everything now so mistakes show up at build time (and, for the
-    // small runtimes, keep the machine code)
+    // compile everything to bytecode (mistakes show up now)
     #[cfg(feature = "jit")]
     let mut vm = Vm::for_build(rt.gui);
     #[cfg(not(feature = "jit"))]
-    let mut vm = Vm::compiled();
-    vm.bundle = Some(modules.clone());
+    let mut vm = Vm::new();
+    let mut binary = found.compiled.clone();
+    match vm.compile_to_bytecode(&main_name, &src) {
+        Ok(b) => {
+            binary.insert(MAIN_KEY.to_string(), b);
+        }
+        Err(e) => {
+            eprintln!("{}", e);
+            return 1;
+        }
+    }
+    for (key, msrc) in found.sources.iter() {
+        let name = Path::new(key).file_name().map_or(key.clone(), |n| n.to_string_lossy().into_owned());
+        match vm.compile_to_bytecode(&name, msrc) {
+            Ok(b) => {
+                let fbc = match key.strip_suffix(".fst") {
+                    Some(stem) => format!("{}.fbc", stem),
+                    None => format!("{}.fbc", key),
+                };
+                binary.insert(fbc, b);
+            }
+            Err(e) => {
+                eprintln!("File \"{}\": {}", key, e);
+                return 1;
+            }
+        }
+    }
+
+    // machine code for the small runtimes: the program's modules and the
+    // standard-library modules it may import
     let mut aot: Option<Vec<u8>> = None;
     #[cfg(feature = "jit")]
     if rt.aot {
-        match vm.build_native(path, &src, &stdlib_imports(sources())) {
+        let mut keys: Vec<&String> = binary.keys().collect();
+        keys.sort();
+        let mut mods: Vec<&[u8]> = keys.iter().map(|k| binary[*k].as_slice()).collect();
+        for name in stdlib_imports(sources()) {
+            if let Some(code) = crate::stdlib::bytecode(&name) {
+                mods.push(code);
+            }
+        }
+        match vm.build_aot(&mods) {
             Ok(code) => aot = Some(code),
             Err(e) => {
                 eprintln!("{}", e);
                 return 1;
             }
-        }
-    }
-    if aot.is_none() {
-        if let Err(e) = vm.check_program(path, &src) {
-            eprintln!("{}", e);
-            return 1;
         }
     }
     let (native, interpreted) = vm.native_stats().unwrap_or((0, 0));
@@ -365,8 +399,10 @@ pub fn build(path: &str, out: Option<&str>, force_gui: bool) -> i32 {
     };
     let runtime_size = exe.len();
     let code_size: usize = aot.as_ref().map_or(0, |a| a.len());
-    let nmods = 1 + modules.keys().filter(|k| !k.starts_with('\0') || k.starts_with(BINARY_PREFIX)).count();
-    let payload = encode(&Bundle { main_name, main_src: src, modules, aot });
+    let nmods = binary.len();
+    let mut modules = HashMap::new();
+    modules.insert(PATH_KEY.to_string(), found.path.clone());
+    let payload = encode(&Bundle { main_name, modules, binary, aot });
     let mut bytes = exe;
     bytes.extend_from_slice(&payload);
     bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
@@ -389,19 +425,19 @@ pub fn build(path: &str, out: Option<&str>, force_gui: bool) -> i32 {
         use std::os::unix::fs::PermissionsExt;
         let _ = fs::set_permissions(&out, fs::Permissions::from_mode(0o755));
     }
-    println!(
-        "built {} ({} module{}, {} function{} compiled to native code{})",
-        out.display(),
-        nmods,
-        if nmods == 1 { "" } else { "s" },
-        native,
-        if native == 1 { "" } else { "s" },
-        if interpreted > 0 { format!(", {} interpreted", interpreted) } else { String::new() }
-    );
     let mb = |n: usize| n as f64 / (1024.0 * 1024.0);
     if rt.aot {
         println!(
-            "  {:.1} MB: {} runtime {:.1} MB + machine code {} KB + sources {} KB",
+            "built {} ({} module{}, {} function{} compiled to native code{})",
+            out.display(),
+            nmods,
+            if nmods == 1 { "" } else { "s" },
+            native,
+            if native == 1 { "" } else { "s" },
+            if interpreted > 0 { format!(", {} interpreted", interpreted) } else { String::new() }
+        );
+        println!(
+            "  {:.1} MB: {} runtime {:.1} MB + machine code {} KB + bytecode {} KB",
             mb(bytes.len()),
             if rt.gui { "gui" } else { "small" },
             mb(runtime_size),
@@ -409,8 +445,9 @@ pub fn build(path: &str, out: Option<&str>, force_gui: bool) -> i32 {
             (payload.len() - code_size).div_ceil(1024),
         );
     } else {
+        println!("built {} ({} module{})", out.display(), nmods, if nmods == 1 { "" } else { "s" });
         println!(
-            "  {:.1} MB (full faston as the runtime: it compiles the program when it starts; put faston-rt{} next to faston for smaller programs, see scripts/)",
+            "  {:.1} MB (full faston as the runtime: it compiles the program to machine code when it starts; put faston-rt{} next to faston for smaller programs, see scripts/)",
             mb(bytes.len()),
             if uses_gui || force_gui { "-gui" } else { "" }
         );
@@ -419,6 +456,7 @@ pub fn build(path: &str, out: Option<&str>, force_gui: bool) -> i32 {
 }
 
 /// Length of the binary part of an executable that carries a bundle.
+#[cfg(feature = "compiler")]
 fn strip(exe: &[u8]) -> Option<usize> {
     let n = exe.len();
     if n < 16 || &exe[n - 8..] != MAGIC {

@@ -2,7 +2,16 @@
 
 A Python-like language with braces, parentheses and semicolons. Programs are
 **compiled to native machine code** (with Cranelift) or run on a fast bytecode
-interpreter — same language, same results. Written in Rust.
+interpreter — same language, same results. **The compiler is written in
+Faston** (self-hosted); the runtime is written in Rust.
+
+The repository has three branches:
+
+| branch   | what                                                                 |
+|----------|----------------------------------------------------------------------|
+| `main`   | the Faston compiler (`compiler/`, in Faston), its seed, tests, docs   |
+| `stage0` | the Rust part: the runtime (VM, GC, JIT, standard library) and the original Rust compiler ("stage 0") used to bootstrap; frozen except for fixes |
+| `vscode` | the VS Code extension                                                |
 
 ```faston
 import math;
@@ -50,43 +59,64 @@ gui.run(draw, title="Demo", width=400, height=260);
 
 ## Build and run
 
-Requires a recent stable Rust toolchain (`rustup`). The `gui` module is
-included by default; `cargo build --release --no-default-features` builds a
-smaller `faston` without it. `scripts/build.ps1` (Windows) or
-`scripts/build.sh` builds both: `faston` and `faston-slim` (see *Executable
-size* below).
+You need a `faston` binary, built once from the `stage0` branch (Rust):
 
 ```sh
-cargo build --release
-./target/release/faston new mygame            # a new project (faston.toml + main.fst)
-./target/release/faston build game.fst        # -> ./game, a standalone native executable
-./target/release/faston run --native game.fst # compile to machine code and run now
-./target/release/faston game.fst              # run in the interpreter (instant start)
-./target/release/faston                       # interactive prompt (interpreter)
-./target/release/faston --dis file.fst        # show the bytecode (also of a .fbc file)
-./target/release/faston compile game.fst      # -> game.fbc, a bytecode file
-./target/release/faston game.fbc              # run a bytecode file
-cargo test --release                          # tests: interpreted, native, built, .fbc
-tests/native.sh                               # quick native-only test run
-python3 tests/fuzz.py 500                     # differential fuzzing vs CPython
-FASTON_NATIVE=1 python3 tests/fuzz.py 500     # ...with native code
-FASTON_GC_STRESS=1 ./target/release/faston f.fst   # collect garbage at every safe point
-bench/run.sh                                  # benchmarks: interpreted / native / CPython
+git worktree add ../faston-stage0 stage0
+cd ../faston-stage0 && scripts/build.sh        # or scripts\build.ps1 on Windows
 ```
+
+That gives `faston` (the toolchain) and `faston-rt` / `faston-rt-gui` (the
+runtimes built programs use; they contain no compiler). Point `faston` at the
+compiler on this branch:
+
+```sh
+export FASTON_COMPILER=$PWD/seed               # (or copy seed/ to compiler/ next to faston)
+faston new mygame                              # a new project (faston.toml + main.fst)
+faston build game.fst                          # -> ./game, a standalone native executable
+faston run --native game.fst                   # compile to machine code and run now
+faston game.fst                                # run in the interpreter (instant start)
+faston                                         # interactive prompt
+faston compile game.fst                        # -> game.fbc, a bytecode file
+faston --dis file.fst                          # show the bytecode (also of a .fbc file)
+faston tests/run.fst                           # the test suite (--quick: skip built executables)
+```
+
+### Working on the compiler
+
+The compiler is `compiler/*.fst`; `seed/` holds its compiled form, which
+`faston` uses. After changing the compiler:
+
+```sh
+faston compiler/bootstrap.fst --from-seed      # seed -> stage 1 -> stage 2 -> stage 3
+```
+
+compiles it with the current seed (stage 1), compiles it again with stage 1
+(stage 2) and with stage 2 (stage 3), checks that stage 3 equals stage 2 (the
+compiler reproduces itself) and installs stage 2 as the new seed. It takes
+about a second and no Rust is rebuilt. `faston compiler/bootstrap.fst`
+(without `--from-seed`) starts from stage 0, the Rust compiler inside `faston`
+(`--stage0` selects it explicitly).
+
+`faston --stage0 compiler/check.fst` compiles every `.fst` file in the
+repository with both stage 0 and `compiler/` and checks they produce the same
+bytes; `compiler/check_errors.fst` does the same for thousands of broken
+programs (error messages must match).
 
 Source files use the `.fst` extension.
 
 ## Native compilation
 
 `faston build game.fst` produces `game` (`game.exe` on Windows): one file
-containing the Faston runtime and your program, including every `.fst` module
-it imports. It needs nothing else installed — no Faston, no Python, no C
+containing a Faston runtime and your program, compiled: the bytecode of every
+module it imports and their machine code. No source and no compiler go into
+it. It needs nothing else installed — no Faston, no Python, no C
 compiler. `-o name` picks the output name. Mistakes that the compiler can see
 (syntax errors, bad `let`/`const` use, ...) are reported at build time.
 
 **Ahead-of-time compilation.** `faston build` compiles every function to
 machine code at build time and saves it in the executable, next to a small
-runtime that has no code generator in it:
+runtime that has no code generator and no compiler in it:
 
 | program            | runtime          | typical size |
 |--------------------|------------------|--------------|
@@ -99,10 +129,10 @@ The saved code targets a baseline x86-64 CPU (x86-64-v2: any x86-64 CPU from
 roughly 2009 on), so it runs on other machines with the same OS. `--full` uses
 the gui runtime even when the program doesn't import `gui`.
 
-The runtimes are built by `scripts/build.ps1` / `scripts/build.sh` and must sit
-next to `faston`. Without them (or on non-x86-64 machines), `faston build` uses
-`faston` itself as the runtime (~16 MB): it then compiles the program to machine
-code when it starts (the whole startup is ~10 ms). The saved code is checked
+The runtimes are built by `scripts/build.ps1` / `scripts/build.sh` (on the
+`stage0` branch) and must sit next to `faston`. Without them (or on non-x86-64 machines), `faston build` uses
+`faston` itself as the runtime (~16 MB): it then compiles the program's
+bytecode to machine code when it starts (the whole startup is ~10 ms). The saved code is checked
 when the program starts; if it doesn't match the runtime, the program is
 interpreted instead, so a built program always runs. `faston run --native
 file.fst` compiles and runs without writing an executable.
@@ -648,50 +678,31 @@ source ─► lexer ─► single-pass compiler ─► bytecode ─┬─► int
 ## Project layout
 
 ```
-src/
-  main.rs       CLI, REPL
-  lexer.rs      tokens; f-strings are desugared here
-  compiler.rs   single-pass compiler + peephole fusion
-  bytecode.rs   instruction set, fusion rules
-  vm.rs         interpreter loop, calls, inline caches
-  jit.rs        native code generator: type inference, Cranelift IR (also for `faston build`)
-  jit_rt.rs     what compiled code needs at run time: helpers, loading saved machine code
-  bundle.rs     `faston build`: standalone executables
-  fbc.rs        bytecode files: format, loader + verifier, the `bytecode` module
-  bytesmod.rs   bytes, bytearray, text encodings
-  value.rs      Value, heap objects, garbage collector, dicts
-  ops.rs        operator semantics (Python-compatible)
-  builtins.rs   built-in functions, methods, math/random/time
-  fileio.rs     open(), file objects, standard streams
-  osmod.rs      sys, os, os.path, shutil
-  json.rs       json module
-  re.rs         re module (fancy-regex)
-  natives.rs    native helpers for the Faston-written modules
-  stdlib/*.fst  datetime, collections, subprocess (built into the executable)
-  modules.rs    finding modules and packages (disk or a built program's bundle)
-  pkg.rs        faston.toml, faston new / add / install / remove
-  gui.rs        gui module (egui): windows, widgets, canvas
-  fx.rs         fast hash function
-editors/vscode/ the VS Code extension
+compiler/
+  lexer.fst          tokens; f-strings are desugared here
+  ops.fst            instructions: peephole fusion rules, jump targets
+  compiler.fst       single-pass compiler (no AST) + the .fbc writer
+  bootstrap.fst      stage 0/seed -> stage 1 -> stage 2 -> stage 3, installs the seed
+  check.fst          same bytes as stage 0 on every .fst file
+  check_errors.fst   same errors as stage 0 on broken programs
+seed/                the compiled compiler (stage 2) that faston uses
 tests/
-  cases/*.fst   programs + expected output (.out); `_*.fst` are helper modules
-  errors/*.fst  programs that must fail with the message in .err
-  run.rs        cargo test runner (every test interpreted, native, and built ahead of time)
-  native.sh     run the tests compiled to native code
-  fuzz.py       random programs run in both Faston and CPython
-examples/       tour.fst, life.fst, arena/ (multi-file), physics.fst (operators,
-                exceptions, tuples, keyword arguments), gui_demo.fst (gui),
-                stdlib_demo.fst (re, collections, datetime, json, subprocess)
-scripts/        build.ps1 / build.sh: build faston, faston-rt and faston-rt-gui
-bench/          benchmarks with CPython equivalents
+  cases/*.fst        programs + expected output (.out); `_*.fst` are helper modules
+  errors/*.fst       programs that must fail with the message in .err
+  run.fst            the test runner
+examples/            tour.fst, life.fst, arena/ (multi-file), physics.fst (operators,
+                     exceptions, tuples, keyword arguments), gui_demo.fst (gui),
+                     stdlib_demo.fst (re, collections, datetime, json, subprocess)
 ```
+
+The runtime (VM, garbage collector, JIT, built-in modules, the bytecode
+loader and verifier) is on the `stage0` branch, under `src/`.
 
 ## Roadmap ideas
 
 An embedding API so a game engine (Rust, C, or a Tauri/JS host) can run Faston
 scripts and register its own functions (`Vm::call` and native functions already
-exist internally); a compiler written in Faston (bootstrapping: the bytecode
-format and the `bytecode` module are the pieces it needs); networking; native file dialogs for the gui; arbitrary-size
+exist internally); networking; native file dialogs for the gui; arbitrary-size
 integers; `async`. For the native compiler: type feedback (record the types
 each operation actually sees, then compile a specialized version) and unboxed
 float fields.

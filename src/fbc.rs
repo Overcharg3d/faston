@@ -192,8 +192,10 @@ impl Vm {
     /// Compiles source into a fresh module and serializes it.
     pub fn compile_to_bytecode(&mut self, name: &str, src: &str) -> Result<Vec<u8>, String> {
         let unit = self.new_unit(name.to_string(), None);
-        let script = self.compile_unit_plain(unit, src)?;
-        self.encode_bytecode(script)
+        match self.compile_source(unit, src)? {
+            (_, Some(data)) => Ok(data),
+            (script, None) => self.encode_bytecode(script),
+        }
     }
 }
 
@@ -454,8 +456,21 @@ fn verify(name: &str, code: &[Op], consts: &[Value], num_locals: u32, ncaptures:
 }
 
 impl Vm {
-    /// Loads a bytecode file into `unit`; returns its top-level function.
+    /// Loads a bytecode file into `unit`; returns its top-level function. Saved
+    /// machine code for it is attached (built programs), or it is compiled to
+    /// machine code now in `faston build` / eager mode.
     pub fn load_bytecode(&mut self, data: &[u8], unit: u32) -> Result<Gc, String> {
+        let script = self.load_bytecode_plain(data, unit)?;
+        if self.jit.as_ref().is_some_and(|j| j.eager) {
+            self.compile_native(script, true);
+        } else if self.aot.is_some() {
+            self.install_aot(data, script);
+        }
+        Ok(script)
+    }
+
+    /// Loads and checks a bytecode file into `unit` (nothing else).
+    pub fn load_bytecode_plain(&mut self, data: &[u8], unit: u32) -> Result<Gc, String> {
         if data.len() < 8 || &data[..6] != MAGIC {
             return Err(bad("not a Faston bytecode file"));
         }
@@ -482,9 +497,6 @@ impl Vm {
         let script = r.function(self, None, 0)?;
         if r.pos != data.len() {
             return Err(bad("extra data after the module"));
-        }
-        if self.jit.as_ref().is_some_and(|j| j.eager) {
-            self.compile_native(script, true);
         }
         Ok(script)
     }

@@ -11,33 +11,11 @@
 //!   variable stays on the stack while its scope is alive and is moved to the heap
 //!   ("closed") when the scope ends, so closures share variables, like Python.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use crate::bytecode::Op;
 use crate::lexer::{Tok, Token};
-use crate::value::{sym, Function, Gc, Heap, Interner, Obj, Value};
-
-/// Global variable table of one module, shared by every compilation run of it
-/// (so the REPL works).
-#[derive(Default, Clone)]
-pub struct Globals {
-    pub index: HashMap<String, u32>,
-    pub names: Vec<String>,
-    pub is_const: Vec<bool>,
-}
-
-impl Globals {
-    pub fn slot(&mut self, name: &str) -> u32 {
-        if let Some(&i) = self.index.get(name) {
-            return i;
-        }
-        let i = self.names.len() as u32;
-        self.index.insert(name.to_string(), i);
-        self.names.push(name.to_string());
-        self.is_const.push(false);
-        i
-    }
-}
+use crate::value::{sym, Function, Gc, Globals, Heap, Interner, Obj, Value};
 
 struct Local {
     name: String,

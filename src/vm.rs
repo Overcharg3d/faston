@@ -18,7 +18,9 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::bytecode::Op;
-use crate::compiler::{Compiler, Globals};
+#[cfg(feature = "compiler")]
+use crate::compiler::Compiler;
+#[cfg(feature = "compiler")]
 use crate::lexer;
 use crate::ops;
 use crate::value::*;
@@ -46,6 +48,9 @@ pub mod jit {
 }
 
 pub(crate) const STACK_SLOTS: usize = 1 << 20;
+
+/// `--stage0`: compile with the built-in Rust compiler even if compiler.fbc exists.
+pub static STAGE0: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub(crate) const MAX_FRAMES: usize = 10_000;
 
 /// The value stack, allocated zeroed so the OS can hand out pages lazily
@@ -241,67 +246,9 @@ struct Handler {
     target: u32,
 }
 
-/// Built-in exception classes, defined in Faston so programs can subclass them.
-const PRELUDE: &str = r#"
-class BaseException {
-    def init(self, message = "") { self.message = message; }
-    def __str__(self) { return str(self.message); }
-    def __repr__(self) { return type(self) + "(" + repr(self.message) + ")"; }
-}
-class Exception(BaseException) { pass; }
-class ArithmeticError(Exception) { pass; }
-class ZeroDivisionError(ArithmeticError) { pass; }
-class OverflowError(ArithmeticError) { pass; }
-class LookupError(Exception) { pass; }
-class IndexError(LookupError) { pass; }
-class KeyError(LookupError) { pass; }
-class TypeError(Exception) { pass; }
-class ValueError(Exception) { pass; }
-class NameError(Exception) { pass; }
-class AttributeError(Exception) { pass; }
-class RuntimeError(Exception) { pass; }
-class RecursionError(RuntimeError) { pass; }
-class NotImplementedError(RuntimeError) { pass; }
-class AssertionError(Exception) { pass; }
-class ImportError(Exception) { pass; }
-class OSError(Exception) { pass; }
-class IOError(OSError) { pass; }
-class FileNotFoundError(OSError) { pass; }
-class FileExistsError(OSError) { pass; }
-class PermissionError(OSError) { pass; }
-class IsADirectoryError(OSError) { pass; }
-class NotADirectoryError(OSError) { pass; }
-class TimeoutError(OSError) { pass; }
-class EOFError(Exception) { pass; }
-class ModuleNotFoundError(ImportError) { pass; }
-class UnicodeError(ValueError) { pass; }
-class UnicodeDecodeError(UnicodeError) { pass; }
-class UnicodeEncodeError(UnicodeError) { pass; }
-class Enum {
-    def __str__(self) { return type(self) + "." + self.name; }
-    def __repr__(self) { return "<" + type(self) + "." + self.name + ": " + repr(self.value) + ">"; }
-}
-class JSONDecodeError(ValueError) { pass; }
-class SyntaxError(Exception) { pass; }
-class StopIteration(Exception) { pass; }
-class KeyboardInterrupt(BaseException) { pass; }
-class GeneratorExit(BaseException) { pass; }
-class property {
-    def init(self, fget = None, fset = None, fdel = None, doc = None) {
-        self.fget = fget; self.fset = fset; self.fdel = fdel; self.__doc__ = doc;
-    }
-    def getter(self, f) { return property(f, self.fset, self.fdel, self.__doc__); }
-    def setter(self, f) { return property(self.fget, f, self.fdel, self.__doc__); }
-    def deleter(self, f) { return property(self.fget, self.fset, f, self.__doc__); }
-}
-class staticmethod {
-    def init(self, f) { self.__func__ = f; }
-    def __call__(self, *args, **kwargs) { return self.__func__(*args, **kwargs); }
-}
-class classmethod {
-    def init(self, f) { self.__func__ = f; }
-}
-"#;
+// The prelude (built-in exception classes and friends, written in Faston so
+// programs can subclass them) is src/prelude.fst; the VM loads its compiled
+// form, src/prelude.fbc (see stdlib.rs).
 
 impl Frame {
     /// The function running in this frame.
@@ -372,10 +319,13 @@ pub struct Vm {
     aot: Option<Box<jit_rt::Aot>>,
     /// Functions given saved machine code.
     pub aot_count: usize,
-    /// While building: the machine code of every module compiled so far.
-    aot_out: Option<Vec<jit_rt::AotUnit>>,
     /// Calls go to native code (there is a code generator or saved code).
     native: bool,
+    /// The Faston compiler's compile() (from compiler.fbc), once found.
+    fcompiler: Option<Value>,
+    compiler_searched: bool,
+    /// Binary files of a built program (bytecode), by bundle path.
+    pub bundle_bin: HashMap<String, Vec<u8>>,
     /// Register the real gui module (when compiled in).
     pub(crate) gui: bool,
     /// Source files bundled into a built executable, by module name.
@@ -452,8 +402,10 @@ impl Vm {
             jit: None,
             aot: None,
             aot_count: 0,
-            aot_out: None,
             native: false,
+            fcompiler: None,
+            compiler_searched: false,
+            bundle_bin: HashMap::new(),
             gui,
             bundle: None,
             open_files: Vec::new(),
@@ -478,7 +430,7 @@ impl Vm {
     /// Runs the prelude and makes everything it defines a built-in.
     fn load_prelude(&mut self) {
         let unit = self.new_unit("<prelude>".into(), None);
-        let script = self.compile_unit(unit, PRELUDE).expect("prelude compiles");
+        let script = self.load_bytecode_plain(crate::stdlib::PRELUDE, unit).expect("prelude loads");
         self.call(Value::Obj(script), &[]).expect("prelude runs");
         let u = &self.units[unit as usize];
         let defs: Vec<(String, Value)> = u
@@ -624,34 +576,141 @@ impl Vm {
 
     /// Compiles `src` into `unit` and returns its top-level function.
     fn compile_unit(&mut self, unit: u32, src: &str) -> Result<Gc, String> {
-        let script = self.compile_unit_plain(unit, src)?;
-        #[cfg(feature = "jit")]
-        if self.aot_out.is_some() {
-            // building: save machine code instead of installing it
-            let funcs = jit_rt::unit_funcs(script);
-            let mut jit = self.jit.take().unwrap();
-            let saved = jit.compile_aot(self, &funcs);
-            self.jit = Some(jit);
-            let unit = jit_rt::AotUnit { src: jit_rt::hash_str(src), funcs: saved };
-            self.aot_out.as_mut().unwrap().push(unit);
-            return Ok(script);
-        }
+        let (script, _) = self.compile_source(unit, src)?;
         if self.jit.as_ref().is_some_and(|j| j.eager) {
             self.compile_native(script, true);
-        } else if self.aot.is_some() {
-            self.install_aot(src, script);
         }
         Ok(script)
     }
 
-    /// Compiles `src` into `unit` (bytecode only).
-    fn compile_unit_plain(&mut self, unit: u32, src: &str) -> Result<Gc, String> {
+    /// Source -> bytecode loaded into `unit`: with the Faston compiler
+    /// (compiler.fbc) when there is one, otherwise the built-in Rust compiler
+    /// (stage 0). Also gives the .fbc bytes when the Faston compiler made them.
+    pub fn compile_source(&mut self, unit: u32, src: &str) -> Result<(Gc, Option<Vec<u8>>), String> {
+        if !self.compiler_searched {
+            self.compiler_searched = true;
+            self.find_compiler();
+        }
+        if let Some(f) = self.fcompiler {
+            let data = self.run_faston_compiler(f, unit, src)?;
+            let script = self.load_bytecode_plain(&data, unit)?;
+            return Ok((script, Some(data)));
+        }
+        self.compile_stage0(unit, src).map(|s| (s, None))
+    }
+
+    /// The built-in Rust compiler.
+    #[cfg(feature = "compiler")]
+    fn compile_stage0(&mut self, unit: u32, src: &str) -> Result<Gc, String> {
         let toks = lexer::lex(src)?;
         let u = &mut self.units[unit as usize];
         let script = Compiler::new(toks, &mut u.gtable, &mut self.heap, &mut self.syms, unit).compile()?;
         let n = u.gtable.names.len();
         u.globals.resize(n, Value::Undef);
         Ok(script)
+    }
+
+    #[cfg(not(feature = "compiler"))]
+    fn compile_stage0(&mut self, _unit: u32, _src: &str) -> Result<Gc, String> {
+        Err("RuntimeError: this Faston runtime has no compiler (it runs built programs); set FASTON_COMPILER to a folder with compiler.fbc".into())
+    }
+
+    /// Loads the Faston compiler: FASTON_COMPILER (a folder with compiler.fbc,
+    /// or "stage0" for the built-in one), else `compiler/` next to the executable.
+    fn find_compiler(&mut self) {
+        if STAGE0.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let dir = match std::env::var_os("FASTON_COMPILER") {
+            Some(v) if v == "stage0" => return,
+            Some(v) => Some(PathBuf::from(v)),
+            None => std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("compiler"))),
+        };
+        let Some(dir) = dir else { return };
+        let file = dir.join("compiler.fbc");
+        if !file.is_file() {
+            if std::env::var_os("FASTON_COMPILER").is_some() {
+                eprintln!("faston: warning: no compiler.fbc in {}; using the built-in compiler", dir.display());
+            }
+            return;
+        }
+        match self.load_faston_compiler(&dir, &file) {
+            Ok(f) => self.fcompiler = Some(f),
+            Err(e) => eprintln!("faston: warning: can't load {}: {}; using the built-in compiler", file.display(), e),
+        }
+    }
+
+    fn load_faston_compiler(&mut self, dir: &std::path::Path, file: &std::path::Path) -> Result<Value, String> {
+        let data = std::fs::read(file).map_err(|e| e.to_string())?;
+        let unit = self.new_unit("compiler.fbc".into(), Some(dir.to_path_buf()));
+        // its own modules come from disk, also inside a built program
+        let saved = (self.bundle.take(), std::mem::take(&mut self.bundle_bin));
+        let r = (|| {
+            let script = self.load_bytecode_plain(&data, unit)?;
+            self.call(Value::Obj(script), &[])?;
+            let u = &self.units[unit as usize];
+            match u.gtable.index.get("compile") {
+                Some(&g) => Ok(u.globals[g as usize]),
+                None => Err("it has no compile()".to_string()),
+            }
+        })();
+        self.bundle = saved.0;
+        self.bundle_bin = saved.1;
+        r
+    }
+
+    /// Calls the Faston compiler's compile(source, name, consts).
+    fn run_faston_compiler(&mut self, f: Value, unit: u32, src: &str) -> Result<Vec<u8>, String> {
+        let name = self.units[unit as usize].name.clone();
+        // the module's constants so far (the REPL compiles into one module many times)
+        let mut d = Dict::default();
+        {
+            let u = &self.units[unit as usize];
+            let consts: Vec<String> = u
+                .gtable
+                .names
+                .iter()
+                .zip(u.gtable.is_const.iter())
+                .filter(|(_, c)| **c)
+                .map(|(n, _)| n.clone())
+                .collect();
+            for n in consts {
+                let k = self.heap.string(n);
+                d.insert(to_key(k)?, k, Value::Bool(true));
+            }
+        }
+        let consts = self.heap.dict(d);
+        let s = self.heap.string(src);
+        let n = self.heap.string(name);
+        let r = self.call(f, &[s, n, consts]);
+        let data = match r {
+            Ok(Value::Obj(g)) => match g.get() {
+                Obj::Bytes(b) => b.clone(),
+                _ => return Err("RuntimeError: the compiler returned something other than bytes".into()),
+            },
+            Ok(_) => return Err("RuntimeError: the compiler returned something other than bytes".into()),
+            Err(e) => {
+                self.exc = None;
+                self.trace.clear();
+                self.trace_exc = None;
+                // "CompileError: [line 3] SyntaxError: ..." -> the message itself
+                return Err(match e.strip_prefix("CompileError: ") {
+                    Some(m) => m.to_string(),
+                    None => e,
+                });
+            }
+        };
+        if let Value::Obj(g) = consts {
+            if let Obj::Dict(d) = g.get() {
+                let names: Vec<String> = d.entries.iter().filter_map(|(k, _)| k.as_str().map(str::to_string)).collect();
+                let u = &mut self.units[unit as usize];
+                for n in names {
+                    let slot = u.gtable.slot(&n) as usize;
+                    u.gtable.is_const[slot] = true;
+                }
+            }
+        }
+        Ok(data)
     }
 
     /// Compiles `script` (and, if `nested`, every function nested in it) to
@@ -688,46 +747,24 @@ impl Vm {
         self.run_source(src)
     }
 
-    /// Compiles a program and its bundled modules without running anything
-    /// (`faston build` reports mistakes before producing an executable).
-    pub fn check_program(&mut self, path: &str, src: &str) -> Result<(), String> {
-        let p = std::path::Path::new(path);
-        let unit = &mut self.units[self.main as usize];
-        unit.name = p.file_name().map_or(path.to_string(), |n| n.to_string_lossy().into_owned());
+    /// `faston build`: machine code for bytecode modules (the program's, and
+    /// the standard-library modules it may import), keyed by their bytes.
+    #[cfg(feature = "jit")]
+    pub fn build_aot(&mut self, modules: &[&[u8]]) -> Result<Vec<u8>, String> {
         if let Some(j) = self.jit.as_mut() {
-            j.eager = true;
             j.compiled = 0;
             j.interpreted = 0;
         }
-        self.compile_unit(self.main, src)?;
-        let mut mods: Vec<(String, String)> = self.bundle.clone().unwrap_or_default().into_iter().collect();
-        mods.sort();
-        for (file, msrc) in mods {
-            if file.starts_with('\0') {
-                continue; // metadata (sys.path)
-            }
-            let u = self.new_unit(file.clone(), None);
-            self.compile_unit(u, &msrc).map_err(|e| format!("File \"{}\": {}", file, e))?;
+        let mut units = Vec::new();
+        for (i, data) in modules.iter().enumerate() {
+            let unit = self.new_unit(format!("<build {}>", i), None);
+            let script = self.load_bytecode_plain(data, unit)?;
+            let funcs = jit_rt::unit_funcs(script);
+            let mut jit = self.jit.take().unwrap();
+            let saved = jit.compile_aot(self, &funcs);
+            self.jit = Some(jit);
+            units.push(jit_rt::AotUnit { src: jit_rt::hash_bytes(data), funcs: saved });
         }
-        Ok(())
-    }
-
-    /// `faston build`: compiles the program (and the standard-library modules it
-    /// imports) like `check_program` and returns the machine code to save.
-    #[cfg(feature = "jit")]
-    pub fn build_native(&mut self, path: &str, src: &str, stdlib: &[String]) -> Result<Vec<u8>, String> {
-        self.aot_out = Some(Vec::new());
-        let r = self.check_program(path, src).and_then(|_| {
-            for name in stdlib {
-                if let Some(s) = crate::stdlib::source(name) {
-                    let u = self.new_unit(name.clone(), None);
-                    self.compile_unit(u, s)?;
-                }
-            }
-            Ok(())
-        });
-        let units = self.aot_out.take().unwrap_or_default();
-        r?;
         Ok(jit_rt::aot_encode(&units, &self.syms.names, self.env_hash()))
     }
 
@@ -2502,10 +2539,10 @@ impl Vm {
             return Ok(m);
         }
         let name = self.syms.name(sym).to_string();
-        if let Some(src) = crate::stdlib::source(&name) {
+        if let Some(code) = crate::stdlib::bytecode(&name) {
             let file = format!("<{}>", name);
             let unit = self.new_unit(file.clone(), None);
-            let script = self.compile_unit(unit, src).map_err(|e| format!("File \"{}\": {}", file, e))?;
+            let script = self.load_bytecode(code, unit).map_err(|e| format!("File \"{}\": {}", file, e))?;
             let module = Value::Obj(self.heap.alloc(Obj::Module(ModuleRef { unit, name })));
             self.modules.insert(sym, module);
             self.call(Value::Obj(script), &[])?;
@@ -2542,7 +2579,7 @@ impl Vm {
         };
         let found = {
             let source = match &self.bundle {
-                Some(b) => crate::modules::Source::Bundle(b),
+                Some(b) => crate::modules::Source::Bundle(b, &self.bundle_bin),
                 None => crate::modules::Source::Disk,
             };
             crate::modules::find(&source, &last, &dirs)

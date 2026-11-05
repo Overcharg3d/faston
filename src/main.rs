@@ -5,12 +5,14 @@ mod builtins;
 mod bundle;
 mod bytecode;
 mod bytesmod;
+#[cfg(feature = "compiler")]
 mod compiler;
 mod fileio;
 mod fx;
 #[cfg(feature = "gui")]
 mod gui;
 mod json;
+#[cfg(feature = "compiler")]
 mod lexer;
 mod modules;
 mod natives;
@@ -89,15 +91,27 @@ fn real_main() -> i32 {
             .map(|p| p.lines().map(std::path::PathBuf::from).collect())
             .unwrap_or_default();
         vm.bundle = Some(b.modules);
+        vm.bundle_bin = b.binary;
         vm.set_argv(env::args().collect());
         vm.set_sys_path(path);
-        return report(vm.run_file(&b.main_name, &b.main_src));
+        let Some(code) = vm.bundle_bin.get(bundle::MAIN_KEY).cloned() else {
+            eprintln!("faston: this program's bundle has no bytecode");
+            return 1;
+        };
+        return report(vm.run_bytecode_file(&b.main_name, &code));
     }
-    let args: Vec<String> = env::args().collect();
+    // `--stage0` (anywhere): compile with the built-in Rust compiler
+    let mut args: Vec<String> = env::args().collect();
+    if let Some(i) = args.iter().position(|a| a == "--stage0") {
+        args.remove(i);
+        vm::STAGE0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     let native_env = env::var_os("FASTON_NATIVE").is_some_and(|v| v != "0");
     match args.get(1).map(String::as_str) {
         None => repl(),
         Some("-v") | Some("--version") => println!("Faston {}", VERSION),
+        #[cfg(feature = "compiler")]
+        Some("--gen-stdlib") => return gen_stdlib(args.get(2).map_or("src", String::as_str), args.iter().any(|a| a == "--check")),
         Some("-h") | Some("--help") => usage(),
         Some("--dis") => {
             let path = args.get(2).unwrap_or_else(|| {
@@ -141,6 +155,12 @@ fn real_main() -> i32 {
             };
             return run(&path, native, rest);
         }
+        #[cfg(not(feature = "compiler"))]
+        Some("build") => {
+            eprintln!("faston: this is a runtime for built programs; use the full faston to build");
+            return 2;
+        }
+        #[cfg(feature = "compiler")]
         Some("build") => {
             let mut out = None;
             let mut path = None;
@@ -232,6 +252,41 @@ fn run(path: &str, native: bool, program_args: Vec<String>) -> i32 {
         process::exit(2);
     });
     report(vm.run_file(path, &src))
+}
+
+/// Regenerates (or with `check`, verifies) the built-in bytecode of the prelude
+/// and the standard library from their sources, with the stage 0 compiler.
+#[cfg(feature = "compiler")]
+fn gen_stdlib(src_dir: &str, check: bool) -> i32 {
+    vm::STAGE0.store(true, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::path::Path::new(src_dir);
+    let mut files = vec![("prelude".to_string(), dir.join("prelude.fst"), dir.join("prelude.fbc"))];
+    for n in stdlib::NAMES {
+        files.push((n.to_string(), dir.join("stdlib").join(format!("{}.fst", n)), dir.join("stdlib").join(format!("{}.fbc", n))));
+    }
+    let mut stale = 0;
+    for (name, fst, fbc) in files {
+        let src = read_file(&fst.to_string_lossy());
+        let code = match Vm::new().compile_to_bytecode(&name, &src) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("{}: {}", fst.display(), e);
+                return 1;
+            }
+        };
+        if check {
+            if fs::read(&fbc).ok().as_deref() != Some(code.as_slice()) {
+                eprintln!("{} is out of date: run faston --gen-stdlib", fbc.display());
+                stale += 1;
+            }
+        } else if let Err(e) = fs::write(&fbc, &code) {
+            eprintln!("faston: can't write {}: {}", fbc.display(), e);
+            return 1;
+        } else {
+            println!("{} ({} bytes)", fbc.display(), code.len());
+        }
+    }
+    if stale > 0 { 1 } else { 0 }
 }
 
 fn report(r: Result<(), String>) -> i32 {
