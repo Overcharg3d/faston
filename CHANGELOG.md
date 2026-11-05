@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.0
+
+- `match` / `case` statements: highlighting, hover docs, completions; capture
+  names in patterns are known variables (no false "undefined" warnings)
+- `enum Name { ... }` and `class X(Enum)`: members show up in completion and hover
+- Bytes: `b"..."` / `rb"..."` literals, `bytes`, `bytearray` and their methods,
+  `str.encode`, `\x` / `\u` escapes
+- The `bytecode` and `enum` modules
+
 ## 0.3.0
 
 - Packages: dotted imports (`import game.enemies;`, `from a.b import c as d;`)

@@ -549,7 +549,7 @@ const completionProvider = {
             seen.add(name);
             items.push(makeItem(name, { kind: 'exception', name }, '3', an, { parens: wantParens }));
         }
-        for (const kw of BI.KEYWORDS) {
+        for (const kw of [...BI.KEYWORDS, ...BI.SOFT_KEYWORDS]) {
             if (seen.has(kw)) continue;
             const it = new vscode.CompletionItem(kw, CK.Keyword);
             it.sortText = '4' + kw;

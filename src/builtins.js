@@ -11,7 +11,13 @@ const KEYWORDS = [
     'not', 'True', 'False', 'None', 'is', 'del', 'with', 'yield',
 ];
 
+/** Keywords only in their statement position (they can still be used as names). */
+const SOFT_KEYWORDS = ['match', 'case', 'enum'];
+
 const KEYWORD_DOCS = {
+    match: 'Pattern matching (like Python\'s):\n\n```faston\nmatch (command) {\n    case ["go", direction] { move(direction); }\n    case Point(x, 0) { print("on the x axis"); }\n    case {"id": id} | [id] if id > 0 { print(id); }\n    case _ { print("unknown"); }\n}\n```',
+    case: 'A branch of `match`: literals, captures, `_`, `[a, *rest]`, `{"key": p}`, `Class(p, attr=p)`, `p1 | p2`, `p as name`, and an optional `if` guard.',
+    enum: 'An enumeration. Members get `name` and `value`; unset values count up from 1.\n\n```faston\nenum Color { RED, GREEN, BLUE = 10 }\nprint(Color.RED.value, Color(10), list(Color));\n```',
     let: 'Declares a variable. Inside a block (`if`, loop, `try`...) a `let` is scoped to that block.\n\n```faston\nlet hp = 100;\nlet x, y = 3, 4;\n```',
     const: 'Declares a constant. Reassigning it is a compile error.\n\n```faston\nconst MAX_HP = 100;\n```',
     global: 'Inside a function, lets you assign to a global variable.\n\n```faston\ndef reset() { global score; score = 0; }\n```',
@@ -51,6 +57,8 @@ const KEYWORD_DOCS = {
 
 /** @type {Record<string, Fn>} */
 const FUNCTIONS = {
+    bytes: { params: ['source=b""', 'encoding=None', 'errors="strict"'], doc: 'An immutable byte string: `bytes(3)` (zeros), `bytes([65, 66])`, `bytes("text", "utf-8")`. Literals: `b"\\x00\\xff"`.', returns: 'bytes' },
+    bytearray: { params: ['source=b""', 'encoding=None', 'errors="strict"'], doc: 'A mutable byte string (append, extend, item assignment).', returns: 'bytearray' },
     print: { params: ['*values', 'sep=" "', 'end="\\n"'], doc: 'Prints the values, separated by `sep` and followed by `end`.' },
     input: { params: ['prompt=""'], doc: 'Prints `prompt`, then reads a line from standard input and returns it without the trailing newline.', returns: 'str' },
     len: { params: ['x'], doc: 'Number of items in a string, list, tuple, dict or set (or the result of `__len__`).', returns: 'int' },
@@ -134,16 +142,51 @@ const EXCEPTIONS = {
     TimeoutError: { base: 'OSError', doc: 'An operation timed out.' },
     EOFError: { base: 'Exception', doc: '`input()` reached the end of the input.' },
     ModuleNotFoundError: { base: 'ImportError', doc: 'A module could not be found.' },
-    UnicodeError: { base: 'ValueError', doc: 'Text could not be decoded (Faston files are UTF-8).' },
+    UnicodeError: { base: 'ValueError', doc: 'Text could not be encoded or decoded.' },
+    UnicodeDecodeError: { base: 'UnicodeError', doc: 'Bytes are not valid text in the encoding (`b.decode()`).' },
+    UnicodeEncodeError: { base: 'UnicodeError', doc: 'Text can\'t be represented in the encoding (`s.encode("ascii")`).' },
     JSONDecodeError: { base: 'ValueError', doc: 'Invalid JSON passed to `json.loads` / `json.load`.' },
     KeyboardInterrupt: { base: 'BaseException', doc: 'The user interrupted the program.' },
     GeneratorExit: { base: 'BaseException', doc: 'A generator is being closed.' },
 };
 
 /** Methods per built-in type. */
+const BYTES_METHODS = {
+    decode: { params: ['encoding="utf-8"', 'errors="strict"'], doc: 'The bytes as text. `errors` can be "replace" or "ignore".', returns: 'str' },
+    hex: { params: [], doc: 'Hexadecimal digits: `b"\\xde\\xad".hex()` → "dead".', returns: 'str' },
+    count: { params: ['sub'], doc: 'Occurrences of `sub` (bytes or an int).', returns: 'int' },
+    find: { params: ['sub', 'start=0'], doc: 'Index of `sub`, or -1.', returns: 'int' },
+    rfind: { params: ['sub'], doc: 'Last index of `sub`, or -1.', returns: 'int' },
+    index: { params: ['sub', 'start=0'], doc: 'Like find, but raises ValueError.', returns: 'int' },
+    startswith: { params: ['prefix'], doc: 'True if it starts with `prefix` (or any in a tuple).', returns: 'bool' },
+    endswith: { params: ['suffix'], doc: 'True if it ends with `suffix` (or any in a tuple).', returns: 'bool' },
+    split: { params: ['sep=None', 'maxsplit=-1'], doc: 'Split on whitespace or `sep`.', returns: 'list' },
+    join: { params: ['iterable'], doc: 'Concatenate byte strings with this one between them.' },
+    replace: { params: ['old', 'new', 'count=-1'], doc: 'A copy with `old` replaced.' },
+    strip: { params: ['chars=None'], doc: 'Without leading/trailing whitespace (or `chars`).' },
+    lstrip: { params: ['chars=None'], doc: 'Without leading whitespace (or `chars`).' },
+    rstrip: { params: ['chars=None'], doc: 'Without trailing whitespace (or `chars`).' },
+    upper: { params: [], doc: 'ASCII letters in upper case.' },
+    lower: { params: [], doc: 'ASCII letters in lower case.' },
+    isdigit: { params: [], doc: 'All ASCII digits.', returns: 'bool' },
+    isalpha: { params: [], doc: 'All ASCII letters.', returns: 'bool' },
+};
+
 const METHODS = {
+    bytes: BYTES_METHODS,
+    bytearray: Object.assign({}, BYTES_METHODS, {
+        append: { params: ['byte'], doc: 'Adds one byte (an int 0-255).' },
+        extend: { params: ['iterable'], doc: 'Adds bytes (bytes or ints).' },
+        pop: { params: ['index=-1'], doc: 'Removes and returns a byte.', returns: 'int' },
+        insert: { params: ['index', 'byte'], doc: 'Inserts a byte.' },
+        remove: { params: ['byte'], doc: 'Removes the first occurrence of a byte.' },
+        clear: { params: [], doc: 'Removes everything.' },
+        reverse: { params: [], doc: 'Reverses in place.' },
+        copy: { params: [], doc: 'A copy.', returns: 'bytearray' },
+    }),
     str: {
         upper: { params: [], doc: 'A copy in upper case.', returns: 'str' },
+        encode: { params: ['encoding="utf-8"', 'errors="strict"'], doc: 'The text as bytes (utf-8, ascii or latin-1).', returns: 'bytes' },
         lower: { params: [], doc: 'A copy in lower case.', returns: 'str' },
         strip: { params: ['chars=None'], doc: 'A copy without leading and trailing whitespace (or `chars`).', returns: 'str' },
         lstrip: { params: ['chars=None'], doc: 'A copy without leading whitespace (or `chars`).', returns: 'str' },
@@ -393,6 +436,26 @@ const METHODS = {
 };
 
 const MODULES = {
+    bytecode: {
+        doc: 'Compiled bytecode (.fbc): compile source, load or run bytecode (also hand-made), list opcodes.',
+        members: {
+            compile: { params: ['source', 'name="<string>"'], doc: 'Compiles source to the contents of a .fbc file.', returns: 'bytes' },
+            load: { params: ['data', 'name="<bytecode>"'], doc: 'Checks and loads bytecode; returns a function that runs the module when called.' },
+            run: { params: ['data', 'name="<bytecode>"'], doc: 'Loads and runs bytecode; returns the module.', returns: 'module' },
+            dis: { params: ['data'], doc: 'A readable listing of bytecode.', returns: 'str' },
+            opcodes: { value: 'dict', doc: 'Instruction name → opcode number.' },
+            operands: { value: 'dict', doc: 'Instruction name → operand kinds (K const, L local, G global, S symbol, T jump target, U captured variable, N number).' },
+            VERSION: { value: 'int', doc: 'The bytecode format version.' },
+            MAGIC: { value: 'bytes', doc: 'The first bytes of a .fbc file.' },
+        },
+    },
+    enum: {
+        doc: 'Python-style enums: `class Color(Enum) { RED = auto(); }` (or use `enum Color { RED }`).',
+        members: {
+            Enum: { params: [], doc: 'Base class: attributes become members with `name` and `value`.' },
+            auto: { params: [], doc: 'The next value (previous value + 1, starting at 1).' },
+        },
+    },
     math: {
         doc: 'Mathematical functions and constants.',
         members: {
@@ -646,4 +709,4 @@ function signature(name, fn) {
     return `${name}(${(fn.params || []).join(', ')})${fn.returns ? ' -> ' + fn.returns : ''}`;
 }
 
-module.exports = { KEYWORDS, KEYWORD_DOCS, FUNCTIONS, EXCEPTIONS, METHODS, MODULES, DUNDERS, signature };
+module.exports = { KEYWORDS, SOFT_KEYWORDS, KEYWORD_DOCS, FUNCTIONS, EXCEPTIONS, METHODS, MODULES, DUNDERS, signature };
