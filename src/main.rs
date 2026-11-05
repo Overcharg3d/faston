@@ -8,8 +8,13 @@ mod fx;
 mod gui;
 mod json;
 mod lexer;
+mod modules;
+mod natives;
 mod ops;
 mod osmod;
+mod pkg;
+mod re;
+mod stdlib;
 mod value;
 mod vm;
 
@@ -39,18 +44,32 @@ fn main() {
 }
 
 fn usage() {
-    println!("Usage: faston [file.fst]                  run a program (no file: interactive prompt)");
-    println!("       faston run [--native] file.fst      run it (--native: compile to machine code first)");
-    println!("       faston build file.fst [-o name]     build a standalone native executable");
+    println!("Usage: faston [file.fst] [args...]        run a program (no file: interactive prompt)");
+    println!("       faston run [--native] [file.fst]    run it (--native: compile to machine code first;");
+    println!("                                           no file: the project's main file)");
+    println!("       faston build [file.fst] [-o name]   build a standalone native executable");
+    println!("                    [--full]               (--full: include the gui runtime even if unused)");
     println!("       faston --dis file.fst               show the compiled bytecode");
+    println!();
+    println!("Projects:");
+    println!("       faston new name [--lib]             create a project (or a library package)");
+    println!("       faston add <git url | path> [name]  install a package into .faston/packages");
+    println!("       faston install                      install every package listed in faston.toml");
+    println!("       faston remove name                  uninstall a package");
 }
 
 fn real_main() -> i32 {
     if let Some(b) = bundle::embedded() {
         // a built executable: run the bundled program as native code
         let mut vm = Vm::compiled();
+        let path: Vec<std::path::PathBuf> = b
+            .modules
+            .get(bundle::PATH_KEY)
+            .map(|p| p.lines().map(std::path::PathBuf::from).collect())
+            .unwrap_or_default();
         vm.bundle = Some(b.modules);
         vm.set_argv(env::args().collect());
+        vm.set_sys_path(path);
         return report(vm.run_file(&b.main_name, &b.main_src));
     }
     let args: Vec<String> = env::args().collect();
@@ -86,29 +105,52 @@ fn real_main() -> i32 {
                     (p, Some(_)) => rest.push(p.to_string()),
                 }
             }
-            let path = path.unwrap_or_else(|| {
-                eprintln!("faston: run needs a file");
-                process::exit(2);
-            });
+            let path = match path {
+                Some(p) => p,
+                None => match pkg::project_main() {
+                    Ok((p, _)) => p,
+                    Err(e) => {
+                        eprintln!("faston: run needs a file ({})", e);
+                        process::exit(2);
+                    }
+                },
+            };
             return run(&path, native, rest);
         }
         Some("build") => {
             let mut out = None;
             let mut path = None;
+            let mut full = false;
             let mut it = args[2..].iter();
             while let Some(a) = it.next() {
                 match a.as_str() {
                     "-o" => out = it.next().cloned(),
+                    "--full" => full = true,
                     p if path.is_none() => path = Some(p.to_string()),
                     _ => {}
                 }
             }
-            let path = path.unwrap_or_else(|| {
-                eprintln!("faston: build needs a file");
-                process::exit(2);
-            });
-            return bundle::build(&path, out.as_deref());
+            let path = match path {
+                Some(p) => p,
+                None => match pkg::project_main() {
+                    Ok((p, name)) => {
+                        if out.is_none() {
+                            out = Some(name);
+                        }
+                        p
+                    }
+                    Err(e) => {
+                        eprintln!("faston: build needs a file ({})", e);
+                        process::exit(2);
+                    }
+                },
+            };
+            return bundle::build(&path, out.as_deref(), full);
         }
+        Some("new") => return pkg::cmd_new(&args[2..]),
+        Some("add") => return pkg::cmd_add(&args[2..]),
+        Some("install") => return pkg::cmd_install(),
+        Some("remove") => return pkg::cmd_remove(&args[2..]),
         Some(path) => return run(path, native_env, args[2..].to_vec()),
     }
     0
@@ -120,6 +162,8 @@ fn run(path: &str, native: bool, program_args: Vec<String>) -> i32 {
     let mut argv = vec![path.to_string()];
     argv.extend(program_args);
     vm.set_argv(argv);
+    let dir = std::path::Path::new(path).parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+    vm.set_sys_path(modules::default_path(dir));
     report(vm.run_file(path, &src))
 }
 
@@ -174,6 +218,7 @@ fn open_depth(src: &str) -> i32 {
 fn repl() {
     println!("Faston {} — type 'exit' to quit", VERSION);
     let mut vm = Vm::new();
+    vm.set_sys_path(modules::default_path(std::path::Path::new(".")));
     let stdin = io::stdin();
     let mut buf = String::new();
     loop {

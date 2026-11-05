@@ -79,7 +79,30 @@ fn encode(b: &Bundle) -> Vec<u8> {
     out
 }
 
-/// Module names a source file imports.
+/// Bundle entry holding the program's `sys.path` (relative, one per line).
+pub const PATH_KEY: &str = "\0path";
+
+/// Reads a dotted module name starting at token `j`; returns it and the next index.
+fn dotted(toks: &[lexer::Token], mut j: usize) -> Option<(String, usize)> {
+    let mut name = match toks.get(j).map(|t| &t.tok) {
+        Some(Tok::Ident(n)) => n.clone(),
+        _ => return None,
+    };
+    j += 1;
+    while matches!(toks.get(j).map(|t| &t.tok), Some(Tok::Dot)) {
+        match toks.get(j + 1).map(|t| &t.tok) {
+            Some(Tok::Ident(n)) => {
+                name.push('.');
+                name.push_str(n);
+                j += 2;
+            }
+            _ => break,
+        }
+    }
+    Some((name, j))
+}
+
+/// Module names (possibly dotted) a source file imports.
 fn imports(src: &str) -> Vec<String> {
     let toks = match lexer::lex(src) {
         Ok(t) => t,
@@ -90,20 +113,39 @@ fn imports(src: &str) -> Vec<String> {
     while i < toks.len() {
         match toks[i].tok {
             Tok::Import => {
-                // import a, b;
+                // import a, b.c as d;
                 let mut j = i + 1;
-                while let Some(Tok::Ident(name)) = toks.get(j).map(|t| &t.tok) {
-                    out.push(name.clone());
-                    if !matches!(toks.get(j + 1).map(|t| &t.tok), Some(Tok::Comma)) {
+                while let Some((name, next)) = dotted(&toks, j) {
+                    out.push(name);
+                    j = next;
+                    if matches!(toks.get(j).map(|t| &t.tok), Some(Tok::As)) {
+                        j += 2;
+                    }
+                    if !matches!(toks.get(j).map(|t| &t.tok), Some(Tok::Comma)) {
                         break;
                     }
-                    j += 2;
+                    j += 1;
                 }
-                i = j;
+                i = j.max(i + 1);
             }
             Tok::From => {
-                if let Some(Tok::Ident(name)) = toks.get(i + 1).map(|t| &t.tok) {
-                    out.push(name.clone());
+                if let Some((name, next)) = dotted(&toks, i + 1) {
+                    // `from pkg import sub`: sub may be a submodule
+                    if matches!(toks.get(next).map(|t| &t.tok), Some(Tok::Import)) {
+                        let mut j = next + 1;
+                        while let Some(Tok::Ident(n)) = toks.get(j).map(|t| &t.tok) {
+                            out.push(format!("{}.{}", name, n));
+                            j += 1;
+                            if matches!(toks.get(j).map(|t| &t.tok), Some(Tok::As)) {
+                                j += 2;
+                            }
+                            if !matches!(toks.get(j).map(|t| &t.tok), Some(Tok::Comma)) {
+                                break;
+                            }
+                            j += 1;
+                        }
+                    }
+                    out.push(name);
                 }
                 i += 1;
             }
@@ -113,8 +155,66 @@ fn imports(src: &str) -> Vec<String> {
     out
 }
 
+/// Every module file the program can import, found the way `faston run` finds
+/// them, keyed by path relative to the main file's directory.
+fn collect(main_dir: &Path, src: &str, vm: &mut Vm) -> HashMap<String, String> {
+    let base = crate::modules::canon(main_dir);
+    let search = crate::modules::default_path(&base);
+    let mut modules: HashMap<String, String> = HashMap::new();
+    let mut seen_files: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut todo: Vec<(PathBuf, String)> = vec![(base.clone(), src.to_string())];
+    while let Some((dir, s)) = todo.pop() {
+        for name in imports(&s) {
+            let first = name.split('.').next().unwrap_or("");
+            if vm.module(first).is_some() || crate::stdlib::source(first).is_some() {
+                continue;
+            }
+            let mut dirs = vec![dir.clone()];
+            dirs.extend(search.iter().cloned());
+            for part in name.split('.') {
+                let found = match crate::modules::find(&crate::modules::Source::Disk, part, &dirs) {
+                    Some(f) => f,
+                    None => break, // a missing module fails at run time, as usual
+                };
+                if !found.src.is_empty() || found.display.ends_with(".fst") {
+                    let file = PathBuf::from(&found.key);
+                    let key = crate::modules::relative(&base, &file);
+                    if seen_files.insert(key.clone()) {
+                        modules.insert(key, found.src.clone());
+                        todo.push((found.dir.clone(), found.src.clone()));
+                    }
+                }
+                if !found.package {
+                    break;
+                }
+                dirs = vec![found.dir.clone()];
+            }
+        }
+    }
+    let rel: Vec<String> = search
+        .iter()
+        .map(|d| crate::modules::relative(&base, &crate::modules::canon(d)))
+        .map(|r| if r.is_empty() { ".".to_string() } else { r })
+        .collect();
+    modules.insert(PATH_KEY.to_string(), rel.join("\n"));
+    modules
+}
+
+/// The runtime a built program starts from: `faston-slim` (no gui, much
+/// smaller) next to this executable when the program doesn't import `gui`.
+fn runtime(uses_gui: bool, force_full: bool) -> Option<(PathBuf, bool)> {
+    let me = std::env::current_exe().ok()?;
+    if !uses_gui && !force_full {
+        let slim = me.with_file_name(if cfg!(windows) { "faston-slim.exe" } else { "faston-slim" });
+        if slim.is_file() {
+            return Some((slim, true));
+        }
+    }
+    Some((me, false))
+}
+
 /// Builds `path` into a native executable. Returns the process exit code.
-pub fn build(path: &str, out: Option<&str>) -> i32 {
+pub fn build(path: &str, out: Option<&str>, force_full: bool) -> i32 {
     let src = match fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) => {
@@ -129,25 +229,11 @@ pub fn build(path: &str, out: Option<&str>) -> i32 {
     };
     let main_name = p.file_name().map_or(path.to_string(), |n| n.to_string_lossy().into_owned());
 
-    // the imported modules, found next to the importing file
-    let mut modules: HashMap<String, String> = HashMap::new();
-    let mut todo: Vec<(PathBuf, String)> = vec![(dir.clone(), src.clone())];
-    while let Some((d, s)) = todo.pop() {
-        for name in imports(&s) {
-            if modules.contains_key(&name) {
-                continue;
-            }
-            let file = d.join(format!("{}.fst", name));
-            if let Ok(ms) = fs::read_to_string(&file) {
-                let md = file.parent().map_or(d.clone(), |x| x.to_path_buf());
-                modules.insert(name, ms.clone());
-                todo.push((md, ms));
-            } // else: a built-in module, or an ImportError at run time as usual
-        }
-    }
+    // the imported modules (and packages), found exactly like `faston run` would
+    let mut vm = Vm::compiled();
+    let modules = collect(&dir, &src, &mut vm);
 
     // compile everything now so mistakes show up at build time
-    let mut vm = Vm::compiled();
     vm.bundle = Some(modules.clone());
     if let Err(e) = vm.check_program(path, &src) {
         eprintln!("{}", e);
@@ -155,10 +241,23 @@ pub fn build(path: &str, out: Option<&str>) -> i32 {
     }
     let (native, interpreted) = vm.native_stats().unwrap_or((0, 0));
 
-    let exe = match std::env::current_exe().and_then(fs::read) {
+    let uses_gui = std::iter::once(src.as_str())
+        .chain(modules.iter().filter(|(k, _)| !k.starts_with('\0')).map(|(_, v)| v.as_str()))
+        .any(|s| imports(s).iter().any(|n| n == "gui" || n.starts_with("gui.")));
+    if uses_gui && !cfg!(feature = "gui") {
+        eprintln!("faston: warning: this program imports gui, but this faston was built without it");
+    }
+    let (runtime_path, slim) = match runtime(uses_gui, force_full) {
+        Some(r) => r,
+        None => {
+            eprintln!("faston: can't find the faston executable");
+            return 1;
+        }
+    };
+    let exe = match fs::read(&runtime_path) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("faston: can't read the faston executable: {}", e);
+            eprintln!("faston: can't read {}: {}", runtime_path.display(), e);
             return 1;
         }
     };
@@ -193,12 +292,24 @@ pub fn build(path: &str, out: Option<&str>) -> i32 {
     println!(
         "built {} ({} module{}, {} function{} compiled to native code{})",
         out.display(),
-        modules.len() + 1,
-        if modules.is_empty() { "" } else { "s" },
+        modules.len(),
+        if modules.len() == 1 { "" } else { "s" },
         native,
         if native == 1 { "" } else { "s" },
         if interpreted > 0 { format!(", {} interpreted", interpreted) } else { String::new() }
     );
+    let mb = bytes.len() as f64 / (1024.0 * 1024.0);
+    if slim {
+        println!("  {:.1} MB (slim runtime: no gui)", mb);
+    } else if uses_gui {
+        println!("  {:.1} MB (full runtime: the program uses gui)", mb);
+    } else {
+        println!(
+            "  {:.1} MB (full runtime{})",
+            mb,
+            if force_full { "" } else { "; install faston-slim next to faston for much smaller programs: see scripts/" }
+        );
+    }
     0
 }
 

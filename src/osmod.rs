@@ -66,9 +66,11 @@ fn register_sys(vm: &mut Vm) {
         ("executable", s(vm, exe)),
         ("maxsize", Value::Int(i64::MAX)),
     ];
-    // argv is filled in when the program starts (see Vm::set_argv)
+    // argv and path are filled in when the program starts (Vm::set_argv / set_sys_path)
     let argv = vm.heap.list(Vec::new());
     m.push(("argv", argv));
+    let path = vm.heap.list(Vec::new());
+    m.push(("path", path));
     m.push(("exit", vm.native("exit", sys_exit)));
     vm.define_module("sys", m);
 }

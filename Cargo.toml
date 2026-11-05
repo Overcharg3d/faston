@@ -21,6 +21,8 @@ cranelift-jit = "0.137.0"
 cranelift-module = "0.137.0"
 cranelift-native = "0.137.0"
 mimalloc = "0.1.52"
+fancy-regex = "0.14"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 eframe = { version = "0.37", optional = true }
 winit = { version = "0.30", optional = true }
 image = { version = "0.25", optional = true, default-features = false, features = ["png", "jpeg", "gif", "bmp"] }
@@ -31,6 +33,45 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 debug = false
+strip = true
+
+# The GUI stack is large and not on Faston's hot paths: optimize it for size.
+[profile.release.package.eframe]
+opt-level = "s"
+[profile.release.package.egui]
+opt-level = "s"
+[profile.release.package.epaint]
+opt-level = "s"
+[profile.release.package.emath]
+opt-level = "s"
+[profile.release.package.ecolor]
+opt-level = "s"
+[profile.release.package.egui-winit]
+opt-level = "s"
+[profile.release.package.egui_glow]
+opt-level = "s"
+[profile.release.package.glow]
+opt-level = "s"
+[profile.release.package.glutin]
+opt-level = "s"
+[profile.release.package.winit]
+opt-level = "s"
+[profile.release.package.accesskit]
+opt-level = "s"
+[profile.release.package.accesskit_windows]
+opt-level = "s"
+[profile.release.package.accesskit_winit]
+opt-level = "s"
+[profile.release.package.image]
+opt-level = "s"
+[profile.release.package.png]
+opt-level = "s"
+[profile.release.package.zune-jpeg]
+opt-level = "s"
+[profile.release.package.gif]
+opt-level = "s"
+[profile.release.package.ab_glyph]
+opt-level = "s"
 
 [profile.profiling]
 inherits = "release"

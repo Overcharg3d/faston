@@ -246,6 +246,12 @@ impl Lexer {
             } else if (c == 'f' || c == 'F') && (self.peek(1) == '"' || self.peek(1) == '\'') {
                 self.i += 1;
                 self.fstring()?;
+            } else if (c == 'r' || c == 'R') && (self.peek(1) == '"' || self.peek(1) == '\'') {
+                // raw string: backslashes are kept as they are (regex patterns, Windows paths)
+                self.i += 1;
+                let line = self.line;
+                let s = self.raw_string()?;
+                self.out.push(Token { tok: Tok::Str(s), line });
             } else if c.is_alphabetic() || c == '_' {
                 self.ident();
             } else if c == '"' || c == '\'' {
@@ -357,10 +363,12 @@ impl Lexer {
         self.push(tok);
     }
 
-    /// Reads a quoted string starting at the opening quote; processes escapes.
-    fn string(&mut self) -> Result<String, String> {
+    /// A raw string starting at the opening quote: no escape processing (a
+    /// backslash before the quote keeps both characters, like Python).
+    fn raw_string(&mut self) -> Result<String, String> {
         let quote = self.peek(0);
-        self.i += 1;
+        let triple = self.peek(1) == quote && self.peek(2) == quote;
+        self.i += if triple { 3 } else { 1 };
         let mut s = String::new();
         loop {
             if self.at_end() {
@@ -368,7 +376,45 @@ impl Lexer {
             }
             let c = self.peek(0);
             self.i += 1;
-            if c == quote {
+            if c == quote && (!triple || (self.peek(0) == quote && self.peek(1) == quote)) {
+                if triple {
+                    self.i += 2;
+                }
+                break;
+            }
+            if c == '\n' {
+                self.line += 1;
+            }
+            s.push(c);
+            if c == '\\' && !self.at_end() {
+                let e = self.peek(0);
+                self.i += 1;
+                if e == '\n' {
+                    self.line += 1;
+                }
+                s.push(e);
+            }
+        }
+        Ok(s)
+    }
+
+    /// Reads a quoted string starting at the opening quote; processes escapes.
+    fn string(&mut self) -> Result<String, String> {
+        let quote = self.peek(0);
+        // """triple-quoted""": single quotes inside need no escaping
+        let triple = self.peek(1) == quote && self.peek(2) == quote;
+        self.i += if triple { 3 } else { 1 };
+        let mut s = String::new();
+        loop {
+            if self.at_end() {
+                return Err(self.err("unterminated string"));
+            }
+            let c = self.peek(0);
+            self.i += 1;
+            if c == quote && (!triple || (self.peek(0) == quote && self.peek(1) == quote)) {
+                if triple {
+                    self.i += 2;
+                }
                 break;
             }
             if c == '\n' {

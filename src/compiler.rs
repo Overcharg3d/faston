@@ -846,14 +846,37 @@ impl<'g> Compiler<'g> {
         Ok(())
     }
 
-    /// `import math, random;`
+    /// `game.enemies` (a module name, possibly dotted)
+    fn dotted_name(&mut self, msg: &str) -> Res<String> {
+        let mut name = self.expect_ident(msg)?;
+        while self.check(&Tok::Dot) {
+            self.advance();
+            name.push('.');
+            name.push_str(&self.expect_ident("expected a name after '.'")?);
+        }
+        Ok(name)
+    }
+
+    /// `import math, game.enemies, collections as c;`
     fn import_stmt(&mut self) -> Res<()> {
         self.advance();
         loop {
-            let name = self.expect_ident("expected a module name after 'import'")?;
+            let name = self.dotted_name("expected a module name after 'import'")?;
             let sym = self.name_const(&name);
             self.emit(Op::Import(sym));
-            self.define_named(&name)?;
+            if self.matches(&Tok::As) {
+                let alias = self.expect_ident("expected a name after 'as'")?;
+                self.define_named(&alias)?;
+            } else {
+                // `import a.b` binds `a` (with `b` loaded as its attribute)
+                let first = name.split('.').next().unwrap().to_string();
+                if first != name {
+                    self.emit(Op::Pop);
+                    let fsym = self.name_const(&first);
+                    self.emit(Op::Import(fsym));
+                }
+                self.define_named(&first)?;
+            }
             if !self.matches(&Tok::Comma) {
                 break;
             }
@@ -861,10 +884,10 @@ impl<'g> Compiler<'g> {
         self.expect(Tok::Semi, "expected ';' after import")
     }
 
-    /// `from enemies import Slime, spawn;`
+    /// `from game.enemies import Slime, spawn as make;`
     fn from_import_stmt(&mut self) -> Res<()> {
         self.advance();
-        let module = self.expect_ident("expected a module name after 'from'")?;
+        let module = self.dotted_name("expected a module name after 'from'")?;
         self.expect(Tok::Import, "expected 'import' after the module name")?;
         let msym = self.name_const(&module);
         self.emit(Op::Import(msym));
@@ -873,7 +896,12 @@ impl<'g> Compiler<'g> {
             let n = self.name_const(&name);
             self.emit(Op::Dup);
             self.emit(Op::GetAttr(n));
-            self.define_named(&name)?;
+            let bind = if self.matches(&Tok::As) {
+                self.expect_ident("expected a name after 'as'")?
+            } else {
+                name
+            };
+            self.define_named(&bind)?;
             if !self.matches(&Tok::Comma) {
                 break;
             }

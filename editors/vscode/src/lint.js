@@ -58,12 +58,12 @@ function lint(an, opts = {}) {
         if (!mod) {
             out.push({
                 s: imp.tok.s, e: imp.tok.e, severity: 'error', code: 'faston.import',
-                message: `Module '${imp.module}' not found: Faston looks for ${imp.module}.fst next to this file (built-in modules: math, random, time).`,
+                message: `Module '${imp.module}' not found: Faston looks next to this file, in the project root and in .faston/packages (for ${imp.module.replace(/\./g, '/')}.fst or a ${imp.module.replace(/\./g, '/')}/ folder).`,
             });
             continue;
         }
         for (const n of imp.names || []) {
-            if (!mod.module.get(n.name)) {
+            if (!mod.module.get(n.name) && !an.getModule(imp.module + '.' + n.name)) {
                 out.push({ s: n.tok.s, e: n.tok.e, severity: 'error', code: 'faston.import', message: `'${n.name}' is not defined at the top level of ${imp.module}.fst.` });
             }
         }

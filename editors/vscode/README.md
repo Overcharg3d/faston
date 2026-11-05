@@ -11,7 +11,8 @@ recognized automatically.
   plus semantic highlighting (classes, functions, parameters, constants,
   modules)
 - Completion for names in scope, `self.` members, class instances, modules
-  (`math`, `random`, `time`, `os`, `os.path`, `sys`, `json`, `shutil`, `gui`,
+  (`math`, `random`, `time`, `os`, `os.path`, `sys`, `json`, `shutil`, `re`,
+  `collections`, `datetime`, `subprocess`, `gui`, packages like `game.enemies`,
   and your own `.fst` modules), files (`with (open(p) as f)`), and methods of
   str/list/dict/set/tuple and of the gui `ui` and canvas objects. Unimported modules can be completed too; the
   `import` line is added for you.
@@ -93,5 +94,5 @@ If you have the Faston source open, **Faston: Build the Faston Compiler** runs
 ```sh
 cd editors/vscode
 npx @vscode/vsce package
-code --install-extension faston-0.2.0.vsix
+code --install-extension faston-0.3.0.vsix
 ```

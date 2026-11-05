@@ -90,7 +90,8 @@
           "patterns": [
             { "match": "\\bas\\b", "name": "keyword.control.import.faston" },
             { "match": ",", "name": "punctuation.separator.comma.faston" },
-            { "match": "\\b(math|random|time|os|sys|json|shutil|gui)\\b", "name": "support.type.module.faston entity.name.namespace.faston" },
+            { "match": "\\b(math|random|time|os|sys|json|shutil|gui|re|collections|datetime|subprocess)\\b", "name": "support.type.module.faston entity.name.namespace.faston" },
+            { "match": "\\.", "name": "punctuation.accessor.faston" },
             { "match": "[A-Za-z_]\\w*", "name": "entity.name.namespace.faston" }
           ]
         }
@@ -304,6 +305,47 @@
     },
     "string": {
       "patterns": [
+        {
+          "name": "string.quoted.raw.triple.faston",
+          "begin": "\\b([rR])(\"\"\"|''')",
+          "beginCaptures": {
+            "1": { "name": "storage.type.string.faston" },
+            "2": { "name": "punctuation.definition.string.begin.faston" }
+          },
+          "end": "\\2",
+          "endCaptures": { "0": { "name": "punctuation.definition.string.end.faston" } },
+          "patterns": [{ "match": "\\\\." }]
+        },
+        {
+          "name": "string.quoted.triple.faston",
+          "begin": "(\"\"\"|''')",
+          "beginCaptures": { "1": { "name": "punctuation.definition.string.begin.faston" } },
+          "end": "\\1",
+          "endCaptures": { "0": { "name": "punctuation.definition.string.end.faston" } },
+          "patterns": [{ "include": "#escape" }]
+        },
+        {
+          "name": "string.quoted.raw.double.faston",
+          "begin": "\\b([rR])(\")",
+          "beginCaptures": {
+            "1": { "name": "storage.type.string.faston" },
+            "2": { "name": "punctuation.definition.string.begin.faston" }
+          },
+          "end": "\"",
+          "endCaptures": { "0": { "name": "punctuation.definition.string.end.faston" } },
+          "patterns": [{ "match": "\\\\." }]
+        },
+        {
+          "name": "string.quoted.raw.single.faston",
+          "begin": "\\b([rR])(')",
+          "beginCaptures": {
+            "1": { "name": "storage.type.string.faston" },
+            "2": { "name": "punctuation.definition.string.begin.faston" }
+          },
+          "end": "'",
+          "endCaptures": { "0": { "name": "punctuation.definition.string.end.faston" } },
+          "patterns": [{ "match": "\\\\." }]
+        },
         {
           "name": "string.quoted.double.faston",
           "begin": "\"",

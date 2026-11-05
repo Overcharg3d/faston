@@ -1,0 +1,31 @@
+ann@example.com ann ('ann', 'example') (5, 20) 9 20
+['1', '22', '333'] [('a', '1'), ('b', '2')] ['a', 'b', 'c']
+world hello a2b4c6
+('f00 b00', 4) None True None
+2026 11 {'year': '2026', 'month': '11'} (?P<year>\d{4})-(?P<month>\d\d) 2
+a\.b\*c ['1', '-', '2', '-', '3'] ['B', 'D']
+['o', 't'] True <hi> <yo>
+['30', '45'] cc
+2024-03-01 2 3 738944 2024-04-24
+365 days, 0:00:00 28 2024-02-28 datetime.date(2024, 2, 28)
+2026-11-04 21:39:13.250000 datetime.datetime(2026, 11, 4, 21, 39, 13, 250000) 2026-11-04T21:39:13.250000 2026-11-04 21:39:13.250000 datetime.datetime(2026, 1, 2, 0, 0)
+2026-11-05 01:09:13.250000 2025-09-30 21:39:13.250000 307 days, 21:39:13.250000
+2026/11/04 21:39:13.250000 Wed Wednesday Nov November 308 PM 09 26 % 28.02.2024
+2026-03-05 14:07:09 2026-03-05 14:07:00
+2026-11-04 21:39:13.500000 2024-02-29 09:05:00 09:05:03.000007
+1 day, 2:03:04.000005 -1 day, 23:59:59 datetime.timedelta(seconds=3600) 0:00:00
+129600.0 24.0 3:00:00 -2 days, 23:59:55
+True True [datetime.date(2024, 1, 1), datetime.date(2026, 5, 1)]
+2026-06-15 12:00:00 int True
+ValueError: day is out of range for month
+Counter({'the': 3, 'and': 2, 'cat': 1, 'hat': 1, 'bat': 1}) 3 0 [('the', 3), ('and', 2)] 5 True
+[('the', 3)] 10 ['and', 'and', 'bat', 'cat'] Counter({'a': 2, 'b': 2, 'c': 2, 'd': 1})
+{3: ['the', 'cat', 'and', 'the', 'hat', 'and', 'the', 'bat']} [] 2
+{'b': 1, 'a': 3, 'n': 2}
+deque([1, 2, 3]) 0 4 deque([1, 2, 3]) 3 1 3
+deque([3, 1, 2]) deque([7, 8, 9], maxlen=3) [3, 1, 2]
+Point(x=3, y=4) 3 4 7 {'x': 3, 'y': 4} Point(x=10, y=4) ('x', 'y') True
+{'b': 1, 'a': 2} ['b', 'a']
+'hello\n' 0 
+from getoutput 3
+CalledProcessError: 2

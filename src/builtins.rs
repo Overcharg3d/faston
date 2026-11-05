@@ -452,6 +452,8 @@ fn register_modules(vm: &mut Vm) {
 
     crate::osmod::register(vm);
     crate::json::register(vm);
+    crate::re::register(vm);
+    crate::natives::register(vm);
     #[cfg(feature = "gui")]
     crate::gui::register(vm);
     #[cfg(not(feature = "gui"))]
@@ -2386,8 +2388,32 @@ fn str_method(vm: &mut Vm, s: &str, name: u32, args: &[Value]) -> Option<R> {
 /// Key/value pairs from a dict or an iterable of 2-item sequences.
 fn dict_pairs(vm: &mut Vm, v: Value, what: &str) -> Result<Vec<(Value, Value)>, String> {
     if let Value::Obj(o) = v {
-        if let Obj::Dict(d) = o.get() {
-            return Ok(d.entries.clone());
+        match o.get() {
+            Obj::Dict(d) => return Ok(d.entries.clone()),
+            // a mapping: an object with keys() and [] (Counter, defaultdict, ...)
+            Obj::Instance(_) => {
+                if let Ok(keys) = vm.get_attr(v, sym::KEYS) {
+                    let ks = vm.call(keys, &[])?;
+                    let (mark, items) = rooted_items(vm, ks)?;
+                    let mut out = Vec::with_capacity(items.len());
+                    let mut err = None;
+                    for k in items {
+                        match vm.get_item(v, k) {
+                            Ok(val) => out.push((k, val)),
+                            Err(e) => {
+                                err = Some(e);
+                                break;
+                            }
+                        }
+                    }
+                    vm.temp_reset(mark);
+                    return match err {
+                        Some(e) => Err(e),
+                        None => Ok(out),
+                    };
+                }
+            }
+            _ => {}
         }
     }
     let (mark, items) = rooted_items(vm, v)

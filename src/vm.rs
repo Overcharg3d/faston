@@ -298,6 +298,10 @@ pub struct Unit {
     pub globals: Vec<Value>,
     /// Symbol -> global slot cache for `module.attr` lookups.
     attr_slots: crate::fx::FxMap<u32, u32>,
+    /// A package (directory): `dir` holds its submodules.
+    pub package: bool,
+    /// Submodules imported so far (`game.enemies` -> `enemies`).
+    children: crate::fx::FxMap<u32, Value>,
 }
 
 pub struct Vm {
@@ -547,6 +551,8 @@ impl Vm {
             gtable: self.builtin_names.clone(),
             globals: self.builtin_values.clone(),
             attr_slots: Default::default(),
+            package: false,
+            children: Default::default(),
         }));
         (self.units.len() - 1) as u32
     }
@@ -617,8 +623,10 @@ impl Vm {
         self.compile_unit(self.main, src)?;
         let mut mods: Vec<(String, String)> = self.bundle.clone().unwrap_or_default().into_iter().collect();
         mods.sort();
-        for (name, msrc) in mods {
-            let file = format!("{}.fst", name);
+        for (file, msrc) in mods {
+            if file.starts_with('\0') {
+                continue; // metadata (sys.path)
+            }
             let u = self.new_unit(file.clone(), None);
             self.compile_unit(u, &msrc).map_err(|e| format!("File \"{}\": {}", file, e))?;
         }
@@ -815,7 +823,18 @@ impl Vm {
     pub fn get_item(&mut self, obj: Value, idx: Value) -> Result<Value, String> {
         match dunder(obj, sym::D_GETITEM) {
             Some(m) => self.call(m, &[obj, idx]),
-            None => ops::get_index(&mut self.heap, obj, idx),
+            None => {
+                // native handles with a __getitem__ method (re.Match: m[1])
+                if let Value::Obj(g) = obj {
+                    if let Obj::Handle(h) = g.get() {
+                        let method = h.ty.method;
+                        if let Some(r) = method(self, g, "__getitem__", &[idx]) {
+                            return r;
+                        }
+                    }
+                }
+                ops::get_index(&mut self.heap, obj, idx)
+            }
         }
     }
 
@@ -1443,7 +1462,7 @@ impl Vm {
             self.heap.mark(self.stack[i]);
         }
         for u in self.units.iter() {
-            for v in u.globals.iter() {
+            for v in u.globals.iter().chain(u.children.values()) {
                 self.heap.mark(*v);
             }
         }
@@ -2234,6 +2253,19 @@ impl Vm {
             None => Value::Undef,
         };
         if let Value::Undef = v {
+            // a submodule of a package (imported now if needed)
+            if let Some(&m) = self.units[unit as usize].children.get(&name) {
+                return Ok(m);
+            }
+            if self.units[unit as usize].package {
+                let full = format!("{}.{}", mname, self.syms.name(name));
+                let fsym = self.syms.intern(&full);
+                match self.import(fsym) {
+                    Ok(m) => return Ok(m),
+                    Err(e) if !e.starts_with("ModuleNotFoundError") => return Err(e),
+                    Err(_) => {}
+                }
+            }
             return Err(format!(
                 "AttributeError: module '{}' has no attribute '{}'",
                 mname,
@@ -2244,50 +2276,115 @@ impl Vm {
     }
 
     /// `import name`: a built-in module, or `name.fst` next to the importing file.
+    /// `import name` (possibly dotted): a built-in module, a standard-library
+    /// module written in Faston, or a file / package found next to the importing
+    /// file or on `sys.path` (see modules.rs).
     #[inline(never)]
     fn import(&mut self, sym: u32) -> Result<Value, String> {
         if let Some(&m) = self.modules.get(&sym) {
             return Ok(m);
         }
         let name = self.syms.name(sym).to_string();
-        let (key, src, file, dir) = if let Some(bundle) = &self.bundle {
-            // a built executable: modules come from the bundle, not the disk
-            let key = PathBuf::from(format!("<bundle>/{}.fst", name));
-            if let Some(&m) = self.loaded.get(&key) {
-                return Ok(m);
-            }
-            let src = bundle.get(&name).cloned().ok_or_else(|| {
-                format!("ImportError: no module named '{}' (built-in modules: math, random, time)", name)
-            })?;
-            (key, src, format!("{}.fst", name), None)
-        } else {
-            let cur = self.frames.last().map_or(self.main, |f| f.func().as_func().unit);
-            let dir = self.units[cur as usize].dir.clone().unwrap_or_else(|| PathBuf::from("."));
-            let path = dir.join(format!("{}.fst", name));
-            let key = path.canonicalize().map_err(|_| {
-                format!(
-                    "ImportError: no module named '{}' (looked for {}; built-in modules: math, random, time)",
-                    name,
-                    path.display()
-                )
-            })?;
-            if let Some(&m) = self.loaded.get(&key) {
-                return Ok(m); // already loaded (or loading: circular imports see it partially)
-            }
-            let src = std::fs::read_to_string(&key)
-                .map_err(|e| format!("ImportError: can't read {}: {}", key.display(), e))?;
-            let file = key.file_name().map_or(name.clone(), |n| n.to_string_lossy().into_owned());
-            let dir = key.parent().map(|p| p.to_path_buf());
-            (key, src, file, dir)
+        if let Some(src) = crate::stdlib::source(&name) {
+            let file = format!("<{}>", name);
+            let unit = self.new_unit(file.clone(), None);
+            let script = self.compile_unit(unit, src).map_err(|e| format!("File \"{}\": {}", file, e))?;
+            let module = Value::Obj(self.heap.alloc(Obj::Module(ModuleRef { unit, name })));
+            self.modules.insert(sym, module);
+            self.call(Value::Obj(script), &[])?;
+            return Ok(module);
+        }
+        let (parent, last) = match name.rsplit_once('.') {
+            Some((p, l)) => (Some(p.to_string()), l.to_string()),
+            None => (None, name.clone()),
         };
-        let unit = self.new_unit(file.clone(), dir);
+        let mut parent_unit = None;
+        let dirs: Vec<PathBuf> = match &parent {
+            Some(p) => {
+                let psym = self.syms.intern(p);
+                let pm = self.import(psym)?;
+                let pu = match pm {
+                    Value::Obj(g) => match g.get() {
+                        Obj::Module(m) => m.unit,
+                        _ => return Err(format!("ModuleNotFoundError: No module named '{}'; '{}' is not a package", name, p)),
+                    },
+                    _ => unreachable!(),
+                };
+                if !self.units[pu as usize].package {
+                    return Err(format!("ModuleNotFoundError: No module named '{}'; '{}' is not a package", name, p));
+                }
+                parent_unit = Some(pu);
+                vec![self.units[pu as usize].dir.clone().unwrap_or_default()]
+            }
+            None => {
+                let cur = self.frames.last().map_or(self.main, |f| f.func().as_func().unit);
+                let mut v = vec![self.units[cur as usize].dir.clone().unwrap_or_else(|| PathBuf::from("."))];
+                v.extend(self.sys_path());
+                v
+            }
+        };
+        let found = {
+            let source = match &self.bundle {
+                Some(b) => crate::modules::Source::Bundle(b),
+                None => crate::modules::Source::Disk,
+            };
+            crate::modules::find(&source, &last, &dirs)
+        };
+        let found = found.ok_or_else(|| {
+            let looked: Vec<String> = dirs.iter().map(|d| d.display().to_string()).collect();
+            format!(
+                "ModuleNotFoundError: No module named '{}' (looked in: {})",
+                name,
+                if looked.is_empty() { "nowhere".into() } else { looked.join(", ") }
+            )
+        })?;
+        let key = PathBuf::from(&found.key);
+        let lsym = self.syms.intern(&last);
+        if let Some(&m) = self.loaded.get(&key) {
+            // already loaded (or loading: circular imports see it partially)
+            if let Some(pu) = parent_unit {
+                self.units[pu as usize].children.insert(lsym, m);
+            }
+            return Ok(m);
+        }
+        let unit = self.new_unit(found.display.clone(), Some(found.dir.clone()));
+        self.units[unit as usize].package = found.package;
         let script = self
-            .compile_unit(unit, &src)
-            .map_err(|e| format!("File \"{}\": {}", file, e))?;
+            .compile_unit(unit, &found.src)
+            .map_err(|e| format!("File \"{}\": {}", found.display, e))?;
         let module = Value::Obj(self.heap.alloc(Obj::Module(ModuleRef { unit, name })));
         self.loaded.insert(key, module);
+        if let Some(pu) = parent_unit {
+            self.units[pu as usize].children.insert(lsym, module);
+        }
         self.call(Value::Obj(script), &[])?;
         Ok(module)
+    }
+
+    /// The directories in `sys.path`.
+    fn sys_path(&mut self) -> Vec<PathBuf> {
+        let Some(sys) = self.module("sys") else { return Vec::new() };
+        let p = self.syms.intern("path");
+        match self.get_attr(sys, p) {
+            Ok(Value::Obj(g)) => match g.get() {
+                Obj::List(l) => l.iter().filter_map(|v| v.as_str().map(PathBuf::from)).collect(),
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        }
+    }
+
+    /// Sets `sys.path` (directories searched by `import`).
+    pub fn set_sys_path(&mut self, dirs: Vec<PathBuf>) {
+        let vals: Vec<Value> = dirs.iter().map(|d| self.heap.string(d.display().to_string())).collect();
+        if let Some(sys) = self.module("sys") {
+            let p = self.syms.intern("path");
+            if let Ok(Value::Obj(g)) = self.get_attr(sys, p) {
+                if let Obj::List(l) = g.get_mut() {
+                    *l = vals;
+                }
+            }
+        }
     }
 
     #[inline(never)]

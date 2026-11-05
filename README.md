@@ -52,10 +52,13 @@ gui.run(draw, title="Demo", width=400, height=260);
 
 Requires a recent stable Rust toolchain (`rustup`). The `gui` module is
 included by default; `cargo build --release --no-default-features` builds a
-smaller `faston` without it.
+smaller `faston` without it. `scripts/build.ps1` (Windows) or
+`scripts/build.sh` builds both: `faston` and `faston-slim` (see *Executable
+size* below).
 
 ```sh
 cargo build --release
+./target/release/faston new mygame            # a new project (faston.toml + main.fst)
 ./target/release/faston build game.fst        # -> ./game, a standalone native executable
 ./target/release/faston run --native game.fst # compile to machine code and run now
 ./target/release/faston game.fst              # run in the interpreter (instant start)
@@ -78,6 +81,13 @@ containing the Faston runtime and your program, including every `.fst` module
 it imports. It needs nothing else installed — no Faston, no Python, no C
 compiler. `-o name` picks the output name. Mistakes that the compiler can see
 (syntax errors, bad `let`/`const` use, ...) are reported at build time.
+
+**Executable size.** A built program is a Faston runtime plus your sources, so
+its size is mostly the runtime: about 16 MB with the `gui` module and 7 MB
+without it. `faston build` uses `faston-slim` (the runtime without `gui`, made
+by `scripts/build.ps1` / `build.sh` next to `faston`) for any program that
+doesn't import `gui`, and prints which runtime it used; `--full` forces the
+full one.
 
 When the executable starts, every function is compiled to machine code for the
 CPU it is running on, the first time it is called (the whole startup is ~10 ms).
@@ -348,14 +358,74 @@ open when the program ends are flushed.
   getenv putenv unsetenv system walk cpu_count getpid environ name sep linesep`
 - `os.path`: `join exists isfile isdir isabs basename dirname split splitext
   abspath normpath realpath relpath expanduser getsize getmtime`
-- `sys`: `argv exit platform version executable maxsize stdin stdout stderr`
+- `sys`: `argv path exit platform version executable maxsize stdin stdout
+  stderr`
 - `json`: `dumps loads dump load` (`indent=`, `sort_keys=`, `ensure_ascii=`,
   `separators=`; Python's output format and error messages)
 - `shutil`: `copyfile copy copytree move rmtree which`
+- `re`: `compile search match fullmatch findall finditer sub subn split escape`
+  and the flags `I M S X`; Python syntax including named groups,
+  look-around and backreferences; match objects have `group groups groupdict
+  start end span` and `m[1]`; `sub` takes `\1` / `\g<name>` templates or a
+  function
+- `datetime`: `date time datetime timedelta` with `now today fromtimestamp
+  fromisoformat strptime strftime isoformat timestamp replace weekday`,
+  arithmetic (`dt + timedelta(hours=3)`, `d2 - d1`) and comparisons (no time
+  zones)
+- `collections`: `Counter defaultdict deque namedtuple OrderedDict`
+- `subprocess`: `run check_output call check_call getoutput getstatusoutput`,
+  `CompletedProcess`, `CalledProcessError`, `TimeoutExpired`, `PIPE STDOUT
+  DEVNULL` (text output; `capture_output=`, `check=`, `cwd=`, `shell=`,
+  `input=`, `timeout=`, `env=`)
 - `gui`: windows, widgets and a drawing canvas (below)
+
+`datetime`, `collections` and `subprocess` are written in Faston (see
+`src/stdlib/`) and built into the executable.
 
 Program arguments follow the file: `faston game.fst --level 3` gives
 `sys.argv == ["game.fst", "--level", "3"]`.
+
+**Strings** also come raw (`r"\d+"`, `r"C:\path"`: backslashes kept) and
+triple-quoted (`"""..."""`, `'''...'''`, `f"""..."""`), like Python's.
+
+### Packages and projects
+
+`import game.enemies;` loads `game/enemies.fst` and binds `game`;
+`from game.enemies import Slime;` and `import game.enemies as en;` work too. A
+package is a folder; an `__init__.fst` in it runs when the package is imported
+(and its top-level names become the package's attributes), but it's optional.
+Imports look in the importing file's folder, then in `sys.path`: the script's
+folder, the project root (the folder with `faston.toml`), the project's
+installed packages (`.faston/packages`), then `FASTON_PATH`. Programs can add
+folders to `sys.path`.
+
+A project is a folder with a `faston.toml`:
+
+```toml
+[package]
+name = "mygame"
+version = "0.1.0"
+main = "main.fst"
+
+[dependencies]
+mathx = "https://github.com/someone/mathx"   # a git repository
+utils = "../utils"                           # or a folder
+```
+
+```sh
+faston new mygame          # create a project (faston new mylib --lib: a library)
+faston run                 # run the main file
+faston add <git url | folder> [name]   # install a package and record it
+faston install             # install everything in faston.toml (after a clone)
+faston remove name         # uninstall
+faston build               # a standalone executable named after the project
+```
+
+Packages are installed into `.faston/packages/<name>` (git clones need `git`
+on your PATH), and a package's own dependencies are installed too. A library
+is a repository with an `__init__.fst` at its root (`faston new NAME --lib`
+makes one). `faston build` bundles every module and package the program
+imports.
 
 ### GUI
 
@@ -425,7 +495,9 @@ TypeError: unsupported operand type(s) for +: 'str' and 'int'
 - A nested function only sees an enclosing function's `let` variable if it was
   declared before the nested `def`/`lambda` (plain assignments are found
   anywhere in the function).
-- `import` looks only next to the importing file (no packages or search path).
+- No relative imports (`from . import x`) and no `from m import *`.
+- `datetime` objects have no time zones, and dates / namedtuples aren't
+  hashable by value (instances hash by identity), so they're poor dict keys.
 
 ## Performance
 
@@ -511,6 +583,11 @@ src/
   fileio.rs     open(), file objects, standard streams
   osmod.rs      sys, os, os.path, shutil
   json.rs       json module
+  re.rs         re module (fancy-regex)
+  natives.rs    native helpers for the Faston-written modules
+  stdlib/*.fst  datetime, collections, subprocess (built into the executable)
+  modules.rs    finding modules and packages (disk or a built program's bundle)
+  pkg.rs        faston.toml, faston new / add / install / remove
   gui.rs        gui module (egui): windows, widgets, canvas
   fx.rs         fast hash function
 editors/vscode/ the VS Code extension
@@ -521,7 +598,9 @@ tests/
   native.sh     run the tests compiled to native code
   fuzz.py       random programs run in both Faston and CPython
 examples/       tour.fst, life.fst, arena/ (multi-file), physics.fst (operators,
-                exceptions, tuples, keyword arguments), gui_demo.fst (gui)
+                exceptions, tuples, keyword arguments), gui_demo.fst (gui),
+                stdlib_demo.fst (re, collections, datetime, json, subprocess)
+scripts/        build.ps1 / build.sh: build faston and faston-slim
 bench/          benchmarks with CPython equivalents
 ```
 

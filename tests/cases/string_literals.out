@@ -1,0 +1,7 @@
+C:\new\table 2 a\'b \d+\s*
+first "line"
+second 'line'	end
+it's "fine" 3
+Hi Ann,
+total: 3
+raw \n triple x True
