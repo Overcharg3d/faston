@@ -17,6 +17,8 @@ pub struct Bundle {
     pub main_name: String,
     pub main_src: String,
     pub modules: HashMap<String, String>,
+    /// Machine code compiled at build time, for runtimes without a code generator.
+    pub aot: Option<Vec<u8>>,
 }
 
 /// The program bundled into the running executable, if any.
@@ -45,39 +47,52 @@ pub fn embedded() -> Option<Bundle> {
 
 fn decode(data: &[u8]) -> Option<Bundle> {
     let mut pos = 0usize;
-    let mut next = || -> Option<String> {
+    let mut next = || -> Option<&[u8]> {
         let n = u32::from_le_bytes(data.get(pos..pos + 4)?.try_into().ok()?) as usize;
         pos += 4;
-        let s = std::str::from_utf8(data.get(pos..pos + n)?).ok()?.to_string();
+        let s = data.get(pos..pos + n)?;
         pos += n;
         Some(s)
     };
-    let main_name = next()?;
-    let main_src = next()?;
+    let text = |b: &[u8]| std::str::from_utf8(b).ok().map(str::to_string);
+    let main_name = text(next()?)?;
+    let main_src = text(next()?)?;
     let mut modules = HashMap::new();
+    let mut aot: Option<Vec<u8>> = None;
     while let Some(name) = next() {
-        let src = next()?;
-        modules.insert(name, src);
+        let body = next()?;
+        if name == AOT_KEY.as_bytes() {
+            aot = Some(body.to_vec());
+        } else {
+            modules.insert(text(name)?, text(body)?);
+        }
     }
-    Some(Bundle { main_name, main_src, modules })
+    Some(Bundle { main_name, main_src, modules, aot })
 }
 
 fn encode(b: &Bundle) -> Vec<u8> {
     let mut out = Vec::new();
-    let mut put = |s: &str| {
+    let mut put = |s: &[u8]| {
         out.extend_from_slice(&(s.len() as u32).to_le_bytes());
-        out.extend_from_slice(s.as_bytes());
+        out.extend_from_slice(s);
     };
-    put(&b.main_name);
-    put(&b.main_src);
+    put(b.main_name.as_bytes());
+    put(b.main_src.as_bytes());
     let mut names: Vec<&String> = b.modules.keys().collect();
     names.sort();
     for n in names {
-        put(n);
-        put(&b.modules[n]);
+        put(n.as_bytes());
+        put(b.modules[n].as_bytes());
+    }
+    if let Some(a) = &b.aot {
+        put(AOT_KEY.as_bytes());
+        put(a);
     }
     out
 }
+
+/// Bundle entry holding the program's machine code (binary).
+pub const AOT_KEY: &str = "\0aot";
 
 /// Bundle entry holding the program's `sys.path` (relative, one per line).
 pub const PATH_KEY: &str = "\0path";
@@ -200,21 +215,57 @@ fn collect(main_dir: &Path, src: &str, vm: &mut Vm) -> HashMap<String, String> {
     modules
 }
 
-/// The runtime a built program starts from: `faston-slim` (no gui, much
-/// smaller) next to this executable when the program doesn't import `gui`.
-fn runtime(uses_gui: bool, force_full: bool) -> Option<(PathBuf, bool)> {
+/// The runtime a built program starts from.
+struct Runtime {
+    path: PathBuf,
+    /// `faston-rt` / `faston-rt-gui`: no code generator, so the program's machine
+    /// code is compiled now and saved in the executable.
+    aot: bool,
+    gui: bool,
+}
+
+/// `faston-rt` (or `faston-rt-gui` for programs that use the gui module) next
+/// to this executable; without them, this executable itself (which compiles the
+/// program when it starts).
+fn runtime(want_gui: bool) -> Option<Runtime> {
     let me = std::env::current_exe().ok()?;
-    if !uses_gui && !force_full {
-        let slim = me.with_file_name(if cfg!(windows) { "faston-slim.exe" } else { "faston-slim" });
-        if slim.is_file() {
-            return Some((slim, true));
+    let _ = want_gui;
+    #[cfg(feature = "jit")]
+    if crate::vm::jit::Jit::aot_supported() {
+        // a specific runtime built with the same features as this faston (tests)
+        if let Some(rt) = std::env::var_os("FASTON_RT") {
+            return Some(Runtime { path: rt.into(), aot: true, gui: cfg!(feature = "gui") });
+        }
+        let name = if want_gui { "faston-rt-gui" } else { "faston-rt" };
+        let rt = me.with_file_name(if cfg!(windows) { format!("{}.exe", name) } else { name.to_string() });
+        if rt.is_file() {
+            return Some(Runtime { path: rt, aot: true, gui: want_gui });
         }
     }
-    Some((me, false))
+    Some(Runtime { path: me, aot: false, gui: cfg!(feature = "gui") })
+}
+
+/// The standard-library modules (written in Faston) the program can import.
+fn stdlib_imports<'a>(sources: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    let mut todo: Vec<&str> = sources.collect();
+    while let Some(s) = todo.pop() {
+        for name in imports(s) {
+            let first = name.split('.').next().unwrap_or("").to_string();
+            if let Some(src) = crate::stdlib::source(&first) {
+                if !found.contains(&first) {
+                    found.push(first);
+                    todo.push(src);
+                }
+            }
+        }
+    }
+    found.sort();
+    found
 }
 
 /// Builds `path` into a native executable. Returns the process exit code.
-pub fn build(path: &str, out: Option<&str>, force_full: bool) -> i32 {
+pub fn build(path: &str, out: Option<&str>, force_gui: bool) -> i32 {
     let src = match fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) => {
@@ -230,34 +281,52 @@ pub fn build(path: &str, out: Option<&str>, force_full: bool) -> i32 {
     let main_name = p.file_name().map_or(path.to_string(), |n| n.to_string_lossy().into_owned());
 
     // the imported modules (and packages), found exactly like `faston run` would
-    let mut vm = Vm::compiled();
-    let modules = collect(&dir, &src, &mut vm);
-
-    // compile everything now so mistakes show up at build time
-    vm.bundle = Some(modules.clone());
-    if let Err(e) = vm.check_program(path, &src) {
-        eprintln!("{}", e);
-        return 1;
-    }
-    let (native, interpreted) = vm.native_stats().unwrap_or((0, 0));
-
-    let uses_gui = std::iter::once(src.as_str())
-        .chain(modules.iter().filter(|(k, _)| !k.starts_with('\0')).map(|(_, v)| v.as_str()))
-        .any(|s| imports(s).iter().any(|n| n == "gui" || n.starts_with("gui.")));
+    let modules = collect(&dir, &src, &mut Vm::new());
+    let sources = || {
+        std::iter::once(src.as_str()).chain(modules.iter().filter(|(k, _)| !k.starts_with('\0')).map(|(_, v)| v.as_str()))
+    };
+    let uses_gui = sources().any(|s| imports(s).iter().any(|n| n == "gui" || n.starts_with("gui.")));
     if uses_gui && !cfg!(feature = "gui") {
         eprintln!("faston: warning: this program imports gui, but this faston was built without it");
     }
-    let (runtime_path, slim) = match runtime(uses_gui, force_full) {
+    let rt = match runtime(uses_gui || force_gui) {
         Some(r) => r,
         None => {
             eprintln!("faston: can't find the faston executable");
             return 1;
         }
     };
-    let exe = match fs::read(&runtime_path) {
+
+    // compile everything now so mistakes show up at build time (and, for the
+    // small runtimes, keep the machine code)
+    #[cfg(feature = "jit")]
+    let mut vm = Vm::for_build(rt.gui);
+    #[cfg(not(feature = "jit"))]
+    let mut vm = Vm::compiled();
+    vm.bundle = Some(modules.clone());
+    let mut aot: Option<Vec<u8>> = None;
+    #[cfg(feature = "jit")]
+    if rt.aot {
+        match vm.build_native(path, &src, &stdlib_imports(sources())) {
+            Ok(code) => aot = Some(code),
+            Err(e) => {
+                eprintln!("{}", e);
+                return 1;
+            }
+        }
+    }
+    if aot.is_none() {
+        if let Err(e) = vm.check_program(path, &src) {
+            eprintln!("{}", e);
+            return 1;
+        }
+    }
+    let (native, interpreted) = vm.native_stats().unwrap_or((0, 0));
+
+    let exe = match fs::read(&rt.path) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("faston: can't read {}: {}", runtime_path.display(), e);
+            eprintln!("faston: can't read {}: {}", rt.path.display(), e);
             return 1;
         }
     };
@@ -266,7 +335,10 @@ pub fn build(path: &str, out: Option<&str>, force_full: bool) -> i32 {
         Some(n) => exe[..n].to_vec(),
         None => exe,
     };
-    let payload = encode(&Bundle { main_name, main_src: src, modules: modules.clone() });
+    let runtime_size = exe.len();
+    let code_size: usize = aot.as_ref().map_or(0, |a| a.len());
+    let nmods = 1 + modules.keys().filter(|k| !k.starts_with('\0')).count();
+    let payload = encode(&Bundle { main_name, main_src: src, modules, aot });
     let mut bytes = exe;
     bytes.extend_from_slice(&payload);
     bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
@@ -292,22 +364,27 @@ pub fn build(path: &str, out: Option<&str>, force_full: bool) -> i32 {
     println!(
         "built {} ({} module{}, {} function{} compiled to native code{})",
         out.display(),
-        modules.len(),
-        if modules.len() == 1 { "" } else { "s" },
+        nmods,
+        if nmods == 1 { "" } else { "s" },
         native,
         if native == 1 { "" } else { "s" },
         if interpreted > 0 { format!(", {} interpreted", interpreted) } else { String::new() }
     );
-    let mb = bytes.len() as f64 / (1024.0 * 1024.0);
-    if slim {
-        println!("  {:.1} MB (slim runtime: no gui)", mb);
-    } else if uses_gui {
-        println!("  {:.1} MB (full runtime: the program uses gui)", mb);
+    let mb = |n: usize| n as f64 / (1024.0 * 1024.0);
+    if rt.aot {
+        println!(
+            "  {:.1} MB: {} runtime {:.1} MB + machine code {} KB + sources {} KB",
+            mb(bytes.len()),
+            if rt.gui { "gui" } else { "small" },
+            mb(runtime_size),
+            code_size.div_ceil(1024),
+            (payload.len() - code_size).div_ceil(1024),
+        );
     } else {
         println!(
-            "  {:.1} MB (full runtime{})",
-            mb,
-            if force_full { "" } else { "; install faston-slim next to faston for much smaller programs: see scripts/" }
+            "  {:.1} MB (full faston as the runtime: it compiles the program when it starts; put faston-rt{} next to faston for smaller programs, see scripts/)",
+            mb(bytes.len()),
+            if uses_gui || force_gui { "-gui" } else { "" }
         );
     }
     0

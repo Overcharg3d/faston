@@ -74,6 +74,76 @@ fn check_errors(native: bool) {
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
 
+/// `faston build`s `prog` with machine code compiled ahead of time (the faston
+/// binary itself standing in for the small runtime) and runs the result. Build
+/// failures come back as the output.
+fn built(prog: &Path) -> std::process::Output {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("built");
+    fs::create_dir_all(&dir).unwrap();
+    let exe = dir.join(prog.file_stem().unwrap()).with_extension(std::env::consts::EXE_EXTENSION);
+    let b = Command::new(env!("CARGO_BIN_EXE_faston"))
+        .arg("build")
+        .arg(prog)
+        .arg("-o")
+        .arg(&exe)
+        .env("FASTON_RT", env!("CARGO_BIN_EXE_faston"))
+        .output()
+        .expect("failed to run faston build");
+    if !b.status.success() {
+        return b;
+    }
+    let out = Command::new(&exe).env("FASTON_JIT_DEBUG", "1").output().expect("failed to run a built program");
+    // every function must have run as saved machine code, not been recompiled
+    // or interpreted because its code didn't match
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    for line in stderr.lines().filter(|l| l.starts_with("[aot]")) {
+        let w: Vec<&str> = line.split_whitespace().collect();
+        let (got, of) = (w[w.len() - 6], w[w.len() - 4]);
+        assert_eq!(got, of, "{}: {}", prog.display(), line);
+    }
+    assert!(stderr.contains("[aot]"), "{}: saved machine code wasn't used:\n{}", prog.display(), stderr);
+    let mut out = out;
+    out.stderr = stderr.lines().filter(|l| !l.starts_with("[aot]")).map(|l| format!("{}\n", l)).collect::<String>().into_bytes();
+    out
+}
+
+#[test]
+fn built_programs_produce_expected_output() {
+    let mut failures = Vec::new();
+    for prog in programs("cases") {
+        let expected = fs::read_to_string(prog.with_extension("out")).unwrap_or_default();
+        let out = built(&prog);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if !out.status.success() || stdout != expected {
+            failures.push(format!(
+                "{} (built)\n--- expected\n{}--- got (exit {:?})\n{}{}",
+                prog.display(),
+                expected,
+                out.status.code(),
+                stdout,
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+#[test]
+fn built_errors_are_reported() {
+    let mut failures = Vec::new();
+    for prog in programs("errors") {
+        let expected = fs::read_to_string(prog.with_extension("err")).unwrap();
+        let out = built(&prog);
+        // syntax errors are reported by `faston build` itself
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        let missing: Vec<&str> = expected.lines().filter(|l| !l.is_empty() && !text.contains(l)).collect();
+        if out.status.success() || !missing.is_empty() {
+            failures.push(format!("{} (built): exit {:?}, missing {:?} in:\n{}", prog.display(), out.status.code(), missing, text));
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
 #[test]
 fn programs_produce_expected_output() {
     check_outputs(false);

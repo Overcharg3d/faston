@@ -23,8 +23,25 @@ use crate::lexer;
 use crate::ops;
 use crate::value::*;
 
+#[path = "jit_rt.rs"]
+pub mod jit_rt;
+#[cfg(feature = "jit")]
 #[path = "jit.rs"]
 pub mod jit;
+
+/// Without the code generator: the same type (so `Vm` keeps one layout, which
+/// ahead-of-time compiled code relies on), doing nothing.
+#[cfg(not(feature = "jit"))]
+pub mod jit {
+    pub struct Jit {
+        pub compiled: usize,
+        pub interpreted: usize,
+        pub eager: bool,
+    }
+    impl Jit {
+        pub fn compile(&mut self, _vm: &mut super::Vm, _funcs: &[crate::value::Gc]) {}
+    }
+}
 
 pub(crate) const STACK_SLOTS: usize = 1 << 20;
 pub(crate) const MAX_FRAMES: usize = 10_000;
@@ -343,6 +360,16 @@ pub struct Vm {
     jit_err: String,
     /// The native code generator, when running compiled (`faston build` / `--jit`).
     jit: Option<Box<jit::Jit>>,
+    /// Machine code saved by `faston build`, attached to functions as they are compiled.
+    aot: Option<Box<jit_rt::Aot>>,
+    /// Functions given saved machine code.
+    pub aot_count: usize,
+    /// While building: the machine code of every module compiled so far.
+    aot_out: Option<Vec<jit_rt::AotUnit>>,
+    /// Calls go to native code (there is a code generator or saved code).
+    native: bool,
+    /// Register the real gui module (when compiled in).
+    pub(crate) gui: bool,
     /// Source files bundled into a built executable, by module name.
     pub bundle: Option<HashMap<String, String>>,
     /// Files opened by the program, flushed when it ends (even without close()).
@@ -372,7 +399,18 @@ impl Vm {
         Self::with_mode(true)
     }
 
+    /// The VM `faston build` compiles a program with: one set up exactly like the
+    /// runtime that will run it (with or without the gui module), so the machine
+    /// code it saves matches what that runtime compiles.
+    pub fn for_build(gui: bool) -> Vm {
+        Self::with_options(true, gui)
+    }
+
     fn with_mode(compiled: bool) -> Vm {
+        Self::with_options(compiled, true)
+    }
+
+    fn with_options(compiled: bool, gui: bool) -> Vm {
         let seed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
@@ -404,6 +442,11 @@ impl Vm {
             stack_ptr: std::ptr::null_mut(),
             jit_err: String::new(),
             jit: None,
+            aot: None,
+            aot_count: 0,
+            aot_out: None,
+            native: false,
+            gui,
             bundle: None,
             open_files: Vec::new(),
             argv: Vec::new(),
@@ -411,9 +454,13 @@ impl Vm {
             descriptors: None,
         };
         vm.stack_ptr = vm.stack.as_mut_ptr();
+        #[cfg(feature = "jit")]
         if compiled {
             vm.jit = Some(Box::new(jit::Jit::new()));
         }
+        #[cfg(not(feature = "jit"))]
+        let _ = compiled;
+        vm.native = vm.jit.is_some();
         crate::builtins::register(&mut vm);
         vm.load_prelude();
         vm.main = vm.new_unit("<stdin>".into(), std::env::current_dir().ok());
@@ -569,8 +616,21 @@ impl Vm {
         let script = Compiler::new(toks, &mut u.gtable, &mut self.heap, &mut self.syms, unit).compile()?;
         let n = u.gtable.names.len();
         u.globals.resize(n, Value::Undef);
+        #[cfg(feature = "jit")]
+        if self.aot_out.is_some() {
+            // building: save machine code instead of installing it
+            let funcs = jit_rt::unit_funcs(script);
+            let mut jit = self.jit.take().unwrap();
+            let saved = jit.compile_aot(self, &funcs);
+            self.jit = Some(jit);
+            let unit = jit_rt::AotUnit { src: jit_rt::hash_str(src), funcs: saved };
+            self.aot_out.as_mut().unwrap().push(unit);
+            return Ok(script);
+        }
         if self.jit.as_ref().is_some_and(|j| j.eager) {
             self.compile_native(script, true);
+        } else if self.aot.is_some() {
+            self.install_aot(src, script);
         }
         Ok(script)
     }
@@ -631,6 +691,48 @@ impl Vm {
             self.compile_unit(u, &msrc).map_err(|e| format!("File \"{}\": {}", file, e))?;
         }
         Ok(())
+    }
+
+    /// `faston build`: compiles the program (and the standard-library modules it
+    /// imports) like `check_program` and returns the machine code to save.
+    #[cfg(feature = "jit")]
+    pub fn build_native(&mut self, path: &str, src: &str, stdlib: &[String]) -> Result<Vec<u8>, String> {
+        self.aot_out = Some(Vec::new());
+        let r = self.check_program(path, src).and_then(|_| {
+            for name in stdlib {
+                if let Some(s) = crate::stdlib::source(name) {
+                    let u = self.new_unit(name.clone(), None);
+                    self.compile_unit(u, s)?;
+                }
+            }
+            Ok(())
+        });
+        let units = self.aot_out.take().unwrap_or_default();
+        r?;
+        Ok(jit_rt::aot_encode(&units, &self.syms.names, self.env_hash()))
+    }
+
+    /// Takes the machine code `faston build` saved; it is attached to functions
+    /// as their modules are compiled. False if it can't be used here (made by
+    /// a different Faston, or for a runtime set up differently).
+    pub fn load_aot(&mut self, data: &[u8]) -> bool {
+        let Some((aot, syms, env)) = jit_rt::Aot::load(data) else { return false };
+        if env != self.env_hash() || !syms.starts_with(&self.syms.names) {
+            return false;
+        }
+        // symbols get the numbers they had when the code was compiled, whatever
+        // order modules are imported in
+        for s in &syms[self.syms.names.len()..] {
+            self.syms.intern(s);
+        }
+        self.aot = Some(Box::new(aot));
+        self.native = true;
+        true
+    }
+
+    /// Identifies the built-ins (whose global slots compiled code uses).
+    fn env_hash(&self) -> u64 {
+        jit_rt::hash_str(&self.builtin_names.names.join("\n"))
     }
 
     /// Compiles and runs a piece of source in the main module (globals persist between
@@ -2964,9 +3066,9 @@ impl Vm {
     /// True when the top frame's function runs natively (or is about to be compiled).
     #[inline]
     fn top_is_native(&self) -> bool {
-        self.jit.is_some() && {
+        self.native && {
             let f = self.frames.last().unwrap().func().as_func();
-            !f.jit.is_null() || f.native_state == 0
+            !f.jit.is_null() || (f.native_state == 0 && self.jit.is_some())
         }
     }
 
@@ -2975,7 +3077,9 @@ impl Vm {
     fn interp(&mut self) -> Result<Value, String> {
         let stop = self.frames.len() - 1;
         // compiled mode: calls go to native code instead of being interpreted inline
-        let native_mode = self.jit.is_some();
+        let native_mode = self.native;
+        // without a code generator, functions with no saved code are interpreted
+        let can_compile = self.jit.is_some();
         let st: *mut Value = self.stack.as_mut_ptr();
         let mut sp = self.sp;
         let (mut code, mut consts, mut ip, mut base, mut upv, mut globals) = {
@@ -3087,7 +3191,7 @@ impl Vm {
                 let base_new: usize = $base_new;
                 let top = base_new + f.num_locals as usize;
                 if f.fast_arity as usize == $nargs
-                    && (!native_mode || f.native_state == 2)
+                    && (!native_mode || f.native_state == 2 || (!can_compile && f.jit.is_null()))
                     && self.frames.len() < MAX_FRAMES
                     && top + (f.max_stack as usize) < STACK_SLOTS
                 {

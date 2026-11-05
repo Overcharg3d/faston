@@ -5,7 +5,7 @@
 //! peephole pass (e.g. `GetLocal2`, `JumpIfNotLt`, `AddLocal`) to cut down
 //! the number of dispatches in hot loops.
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Op {
     // constants
     Const(u32),

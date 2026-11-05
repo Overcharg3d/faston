@@ -82,17 +82,28 @@ it imports. It needs nothing else installed — no Faston, no Python, no C
 compiler. `-o name` picks the output name. Mistakes that the compiler can see
 (syntax errors, bad `let`/`const` use, ...) are reported at build time.
 
-**Executable size.** A built program is a Faston runtime plus your sources, so
-its size is mostly the runtime: about 16 MB with the `gui` module and 7 MB
-without it. `faston build` uses `faston-slim` (the runtime without `gui`, made
-by `scripts/build.ps1` / `build.sh` next to `faston`) for any program that
-doesn't import `gui`, and prints which runtime it used; `--full` forces the
-full one.
+**Ahead-of-time compilation.** `faston build` compiles every function to
+machine code at build time and saves it in the executable, next to a small
+runtime that has no code generator in it:
 
-When the executable starts, every function is compiled to machine code for the
-CPU it is running on, the first time it is called (the whole startup is ~10 ms).
-No bytecode is interpreted. `faston run --native file.fst` does the same
-without writing an executable.
+| program            | runtime          | typical size |
+|--------------------|------------------|--------------|
+| doesn't import gui | `faston-rt`      | ~2.7 MB      |
+| imports `gui`      | `faston-rt-gui`  | ~12 MB       |
+
+The machine code itself is small (a few KB to a few hundred KB). Built programs
+start in a few milliseconds and run exactly as fast as `faston run --native`.
+The saved code targets a baseline x86-64 CPU (x86-64-v2: any x86-64 CPU from
+roughly 2009 on), so it runs on other machines with the same OS. `--full` uses
+the gui runtime even when the program doesn't import `gui`.
+
+The runtimes are built by `scripts/build.ps1` / `scripts/build.sh` and must sit
+next to `faston`. Without them (or on non-x86-64 machines), `faston build` uses
+`faston` itself as the runtime (~16 MB): it then compiles the program to machine
+code when it starts (the whole startup is ~10 ms). The saved code is checked
+when the program starts; if it doesn't match the runtime, the program is
+interpreted instead, so a built program always runs. `faston run --native
+file.fst` compiles and runs without writing an executable.
 
 What the compiler does with your code:
 
@@ -122,7 +133,8 @@ An executable runs on the same kind of system as the `faston` that built it
 prompt always uses the interpreter.
 
 `FASTON_JIT_DEBUG=1` prints, per function, which locals went to registers, the
-Cranelift IR and the generated machine code.
+Cranelift IR and the generated machine code; in a built program it reports how
+many functions got their saved machine code.
 
 ## The language in one page
 
@@ -575,7 +587,8 @@ src/
   compiler.rs   single-pass compiler + peephole fusion
   bytecode.rs   instruction set, fusion rules
   vm.rs         interpreter loop, calls, inline caches
-  jit.rs        native code generator: type inference, Cranelift IR, runtime helpers
+  jit.rs        native code generator: type inference, Cranelift IR (also for `faston build`)
+  jit_rt.rs     what compiled code needs at run time: helpers, loading saved machine code
   bundle.rs     `faston build`: standalone executables
   value.rs      Value, heap objects, garbage collector, dicts
   ops.rs        operator semantics (Python-compatible)
@@ -594,13 +607,13 @@ editors/vscode/ the VS Code extension
 tests/
   cases/*.fst   programs + expected output (.out); `_*.fst` are helper modules
   errors/*.fst  programs that must fail with the message in .err
-  run.rs        cargo test runner (every test interpreted and native)
+  run.rs        cargo test runner (every test interpreted, native, and built ahead of time)
   native.sh     run the tests compiled to native code
   fuzz.py       random programs run in both Faston and CPython
 examples/       tour.fst, life.fst, arena/ (multi-file), physics.fst (operators,
                 exceptions, tuples, keyword arguments), gui_demo.fst (gui),
                 stdlib_demo.fst (re, collections, datetime, json, subprocess)
-scripts/        build.ps1 / build.sh: build faston and faston-slim
+scripts/        build.ps1 / build.sh: build faston, faston-rt and faston-rt-gui
 bench/          benchmarks with CPython equivalents
 ```
 

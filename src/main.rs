@@ -1,3 +1,6 @@
+// a runtime without the code generator leaves parts of the build-time code unused
+#![cfg_attr(not(feature = "jit"), allow(dead_code, unused_mut))]
+
 mod builtins;
 mod bundle;
 mod bytecode;
@@ -60,8 +63,24 @@ fn usage() {
 
 fn real_main() -> i32 {
     if let Some(b) = bundle::embedded() {
-        // a built executable: run the bundled program as native code
-        let mut vm = Vm::compiled();
+        // a built executable: run the bundled program as native code, either the
+        // machine code saved in it or (full runtime) compiled now
+        let mut vm = match &b.aot {
+            Some(code) => {
+                let mut vm = Vm::new();
+                if vm.load_aot(code) {
+                    vm
+                } else if cfg!(feature = "jit") {
+                    Vm::compiled()
+                } else {
+                    if env::var_os("FASTON_JIT_DEBUG").is_some() {
+                        eprintln!("[aot] saved machine code doesn't fit this runtime: interpreting");
+                    }
+                    vm
+                }
+            }
+            None => Vm::compiled(),
+        };
         let path: Vec<std::path::PathBuf> = b
             .modules
             .get(bundle::PATH_KEY)

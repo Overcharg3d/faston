@@ -455,15 +455,15 @@ fn register_modules(vm: &mut Vm) {
     crate::re::register(vm);
     crate::natives::register(vm);
     #[cfg(feature = "gui")]
-    crate::gui::register(vm);
-    #[cfg(not(feature = "gui"))]
-    {
-        fn no_gui(_: &mut Vm, _: &[Value]) -> R {
-            Err("RuntimeError: this faston was built without the gui module (cargo build --features gui)".into())
-        }
-        let run = Value::Obj(vm.heap.alloc(Obj::Native(Native { name: "run", func: no_gui, kwargs: sym::ANY_KW })));
-        vm.define_module("gui", vec![("run", run)]);
+    if vm.gui {
+        crate::gui::register(vm);
+        return;
     }
+    fn no_gui(_: &mut Vm, _: &[Value]) -> R {
+        Err("RuntimeError: this faston was built without the gui module (cargo build --features gui)".into())
+    }
+    let run = Value::Obj(vm.heap.alloc(Obj::Native(Native { name: "run", func: no_gui, kwargs: sym::ANY_KW })));
+    vm.define_module("gui", vec![("run", run)]);
 }
 
 fn want_num(v: Value, what: &str) -> Result<f64, String> {

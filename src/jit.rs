@@ -36,87 +36,8 @@ use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::Module;
 
 use super::*;
-use crate::value::{kind, tag, Layout};
-
-type Entry = unsafe extern "C" fn(*mut Vm, *mut Frame) -> u64;
-
-/// Per-function native code descriptor (`Function::jit` points at one).
-#[repr(C)]
-pub struct JitInfo {
-    pub entry: Entry,
-    pub code: *const Op,
-    pub consts: *const Value,
-    pub globals: *mut Value,
-    pub fast_arity: u64,
-    pub num_locals: u64,
-    /// Stack slots the frame may use: locals + operand stack.
-    pub frame_need: u64,
-    /// Pristine copy of the bytecode (the interpreter rewrites the real one with
-    /// inline-cache forms); helpers are handed instructions from here.
-    ops: Box<[Op]>,
-    /// Inline-cache cells, two `u32`s per site.
-    cells: Box<[u32]>,
-}
-
-/// Byte offsets compiled code needs.
-#[derive(Clone, Copy)]
-struct Off {
-    l: Layout,
-    fr_owner: i32,
-    fr_code: i32,
-    fr_consts: i32,
-    fr_ip: i32,
-    fr_base: i32,
-    fr_ret: i32,
-    fr_upvals: i32,
-    fr_globals: i32,
-    frame_size: i64,
-    vm_stack_ptr: i32,
-    vm_frames_ptr: i32,
-    vm_frames_len: i32,
-    vm_since_gc: i32,
-    vm_threshold: i32,
-    info_entry: i32,
-    info_code: i32,
-    info_consts: i32,
-    info_globals: i32,
-    info_fast_arity: i32,
-    info_frame_need: i32,
-}
-
-impl Off {
-    fn new() -> Off {
-        use std::mem::offset_of;
-        crate::value::check_value_encoding();
-        let l = crate::value::layout();
-        let frames: Vec<Frame> = Vec::with_capacity(4);
-        let (fp, fl) = crate::value::vec_offsets(&frames);
-        let heap = offset_of!(Vm, heap) as i32;
-        Off {
-            l,
-            fr_owner: offset_of!(Frame, owner) as i32,
-            fr_code: offset_of!(Frame, code) as i32,
-            fr_consts: offset_of!(Frame, consts) as i32,
-            fr_ip: offset_of!(Frame, ip) as i32,
-            fr_base: offset_of!(Frame, base) as i32,
-            fr_ret: offset_of!(Frame, ret) as i32,
-            fr_upvals: offset_of!(Frame, upvals) as i32,
-            fr_globals: offset_of!(Frame, globals) as i32,
-            frame_size: std::mem::size_of::<Frame>() as i64,
-            vm_stack_ptr: offset_of!(Vm, stack_ptr) as i32,
-            vm_frames_ptr: offset_of!(Vm, frames) as i32 + fp,
-            vm_frames_len: offset_of!(Vm, frames) as i32 + fl,
-            vm_since_gc: heap + l.heap_since_gc,
-            vm_threshold: heap + l.heap_threshold,
-            info_entry: offset_of!(JitInfo, entry) as i32,
-            info_code: offset_of!(JitInfo, code) as i32,
-            info_consts: offset_of!(JitInfo, consts) as i32,
-            info_globals: offset_of!(JitInfo, globals) as i32,
-            info_fast_arity: offset_of!(JitInfo, fast_arity) as i32,
-            info_frame_need: offset_of!(JitInfo, frame_need) as i32,
-        }
-    }
-}
+use super::jit_rt::*;
+use crate::value::{kind, tag};
 
 pub struct Jit {
     module: JITModule,
@@ -125,6 +46,8 @@ pub struct Jit {
     off: Off,
     call_conv: CallConv,
     frontend: cranelift_codegen::isa::TargetFrontendConfig,
+    /// Target for ahead-of-time code (made on first use).
+    aot_isa: Option<cranelift_codegen::isa::OwnedTargetIsa>,
     debug: bool,
     /// Functions compiled / left to the interpreter.
     pub compiled: usize,
@@ -133,17 +56,21 @@ pub struct Jit {
     pub eager: bool,
 }
 
+fn base_flags() -> settings::Builder {
+    let mut flags = settings::builder();
+    flags.set("opt_level", "speed").unwrap();
+    flags.set("use_colocated_libcalls", "false").unwrap();
+    flags.set("is_pic", "false").unwrap();
+    let verify = if cfg!(debug_assertions) { "true" } else { "false" };
+    flags.set("enable_verifier", verify).unwrap();
+    flags
+}
+
 impl Jit {
     pub fn new() -> Jit {
-        let mut flags = settings::builder();
-        flags.set("opt_level", "speed").unwrap();
-        flags.set("use_colocated_libcalls", "false").unwrap();
-        flags.set("is_pic", "false").unwrap();
-        let verify = if cfg!(debug_assertions) { "true" } else { "false" };
-        flags.set("enable_verifier", verify).unwrap();
         let isa = cranelift_native::builder()
             .unwrap_or_else(|e| panic!("faston: native code generation is not supported on this machine: {}", e))
-            .finish(settings::Flags::new(flags))
+            .finish(settings::Flags::new(base_flags()))
             .expect("faston: failed to set up the code generator");
         let call_conv = isa.default_call_conv();
         let frontend = isa.frontend_config();
@@ -156,11 +83,64 @@ impl Jit {
             off: Off::new(),
             call_conv,
             frontend,
+            aot_isa: None,
             debug: std::env::var_os("FASTON_JIT_DEBUG").is_some(),
             compiled: 0,
             interpreted: 0,
             eager: false,
         }
+    }
+
+    /// Whether this machine can produce ahead-of-time code (x86-64 only: other
+    /// targets would need instruction-cache maintenance when loading it).
+    pub fn aot_supported() -> bool {
+        cfg!(target_arch = "x86_64")
+    }
+
+    /// Analyzes `f`; `None` (and the function marked interpreted) if it can't
+    /// be compiled.
+    fn analyze_fn(&mut self, g: Gc, range_slot: Option<u32>) -> Option<Analysis> {
+        let f = g.as_func();
+        let an = match analyze(f, range_slot) {
+            Some(a) => a,
+            None => {
+                if self.debug {
+                    eprintln!("[jit] {}: left to the interpreter", f.name);
+                }
+                self.interpreted += 1;
+                set_state(g, 2);
+                return None;
+            }
+        };
+        if self.debug {
+            let regs: Vec<String> = an
+                .promoted
+                .iter()
+                .enumerate()
+                .filter_map(|(l, t)| t.map(|t| format!("{}:{:?}", l, t)))
+                .collect();
+            eprintln!("[jit] {}: locals in registers: [{}]", f.name, regs.join(", "));
+        }
+        Some(an)
+    }
+
+    /// Builds the IR of `f` into `self.ctx`; returns its address-table layout.
+    fn build_ir(&mut self, f: &Function, an: &Analysis, ops: &[Op], cells: &[u32], aot: bool) -> Vec<Slot> {
+        let mut sig = Signature::new(self.call_conv);
+        for _ in 0..3 {
+            sig.params.push(AbiParam::new(I64));
+        }
+        sig.returns.push(AbiParam::new(I64));
+        self.ctx.func.signature = sig;
+        let slots = {
+            let b = FunctionBuilder::new(&mut self.ctx.func, &mut self.fctx);
+            let cg = Cg::new(b, f, an, self.off, self.call_conv, ops.as_ptr(), cells.as_ptr(), aot);
+            cg.translate(self.frontend)
+        };
+        if self.debug {
+            eprintln!("[jit] {}:\n{}", f.name, self.ctx.func.display());
+        }
+        slots
     }
 
     /// Compiles `funcs` (those not compiled yet) and installs their native code.
@@ -172,41 +152,10 @@ impl Jit {
             if f.native_state != 0 {
                 continue;
             }
-            let an = match analyze(f, range_slot) {
-                Some(a) => a,
-                None => {
-                    if self.debug {
-                        eprintln!("[jit] {}: left to the interpreter", f.name);
-                    }
-                    self.interpreted += 1;
-                    set_state(g, 2);
-                    continue;
-                }
-            };
-            if self.debug {
-                let regs: Vec<String> = an
-                    .promoted
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(l, t)| t.map(|t| format!("{}:{:?}", l, t)))
-                    .collect();
-                eprintln!("[jit] {}: locals in registers: [{}]", f.name, regs.join(", "));
-            }
+            let Some(an) = self.analyze_fn(g, range_slot) else { continue };
             let ops: Box<[Op]> = an.ops.clone().into_boxed_slice();
             let cells: Box<[u32]> = vec![0u32; 2 * f.code.len()].into_boxed_slice();
-            let mut sig = Signature::new(self.call_conv);
-            sig.params.push(AbiParam::new(I64));
-            sig.params.push(AbiParam::new(I64));
-            sig.returns.push(AbiParam::new(I64));
-            self.ctx.func.signature = sig;
-            {
-                let b = FunctionBuilder::new(&mut self.ctx.func, &mut self.fctx);
-                let cg = Cg::new(b, f, &an, self.off, self.call_conv, ops.as_ptr(), cells.as_ptr());
-                cg.translate(self.frontend);
-            }
-            if self.debug {
-                eprintln!("[jit] {}:\n{}", f.name, self.ctx.func.display());
-            }
+            self.build_ir(f, &an, &ops, &cells, false);
             self.ctx.set_disasm(self.debug);
             let id = self.module.declare_anonymous_function(&self.ctx.func.signature).unwrap();
             if let Err(e) = self.module.define_function(id, &mut self.ctx) {
@@ -245,6 +194,8 @@ impl Jit {
                 fast_arity: f.fast_arity as u64,
                 num_locals: f.num_locals as u64,
                 frame_need: f.num_locals as u64 + f.max_stack as u64,
+                table: std::ptr::null(),
+                table_store: Box::new([]),
                 ops,
                 cells,
             });
@@ -253,342 +204,70 @@ impl Jit {
             self.compiled += 1;
         }
     }
-}
 
-fn set_state(g: Gc, st: u8) {
-    if let Obj::Func(f) = g.get_mut() {
-        f.native_state = st;
-    }
-}
-
-// ---------------------------------------------------------------------------- runtime
-//
-// Functions compiled code calls. They return 0 on success and 1 when an exception
-// was raised (its message parked in `vm.jit_err`); `sp` arguments are absolute
-// stack heights that make the caller's live values visible to the GC.
-
-const OK: u64 = 0;
-const ERR: u64 = 1;
-
-#[inline]
-fn status(vm: &mut Vm, r: Result<(), String>) -> u64 {
-    match r {
-        Ok(()) => OK,
-        Err(e) => {
-            vm.jit_err = e;
-            ERR
+    /// Target for code that runs on other machines: the host architecture with
+    /// a conservative feature set (x86-64-v2: SSE4.2 and POPCNT, which every
+    /// x86-64 CPU of the last fifteen years has).
+    fn make_aot_isa(&mut self) {
+        if self.aot_isa.is_none() {
+            let mut b = cranelift_native::builder_with_options(false).expect("faston: no code generator for this machine");
+            if cfg!(target_arch = "x86_64") {
+                for f in ["has_sse3", "has_ssse3", "has_sse41", "has_sse42", "has_popcnt", "has_cmpxchg16b"] {
+                    let _ = b.enable(f);
+                }
+            }
+            let isa = b.finish(settings::Flags::new(base_flags())).expect("faston: failed to set up the code generator");
+            self.aot_isa = Some(isa);
         }
     }
-}
 
-fn binop_kind(k: u64) -> BinOp {
-    match k {
-        0 => BinOp::Add,
-        1 => BinOp::Sub,
-        2 => BinOp::Mul,
-        3 => BinOp::Div,
-        4 => BinOp::FloorDiv,
-        5 => BinOp::Mod,
-        6 => BinOp::Pow,
-        7 => BinOp::BitAnd,
-        8 => BinOp::BitOr,
-        9 => BinOp::BitXor,
-        10 => BinOp::Shl,
-        _ => BinOp::Shr,
-    }
-}
-
-fn binop_code(k: BinOp) -> i64 {
-    match k {
-        BinOp::Add => 0,
-        BinOp::Sub => 1,
-        BinOp::Mul => 2,
-        BinOp::Div => 3,
-        BinOp::FloorDiv => 4,
-        BinOp::Mod => 5,
-        BinOp::Pow => 6,
-        BinOp::BitAnd => 7,
-        BinOp::BitOr => 8,
-        BinOp::BitXor => 9,
-        BinOp::Shl => 10,
-        BinOp::Shr => 11,
-    }
-}
-
-fn cmp_kind(k: u64) -> CmpOp {
-    match k {
-        0 => CmpOp::Eq,
-        1 => CmpOp::Ne,
-        2 => CmpOp::Lt,
-        3 => CmpOp::Le,
-        4 => CmpOp::Gt,
-        _ => CmpOp::Ge,
-    }
-}
-
-fn cmp_code(k: CmpOp) -> i64 {
-    match k {
-        CmpOp::Eq => 0,
-        CmpOp::Ne => 1,
-        CmpOp::Lt => 2,
-        CmpOp::Le => 3,
-        CmpOp::Gt => 4,
-        CmpOp::Ge => 5,
-    }
-}
-
-extern "C" fn rt_binop(vm: &mut Vm, sp: u64, k: u64, a: *const Value, b: *const Value, out: *mut Value) -> u64 {
-    vm.sp = sp as usize;
-    let r = unsafe { vm.binop(binop_kind(k), *a, *b) }.map(|v| unsafe { *out = v });
-    status(vm, r)
-}
-
-/// 0 / 1 = false / true, 2 = exception.
-extern "C" fn rt_compare(vm: &mut Vm, sp: u64, k: u64, a: *const Value, b: *const Value) -> u64 {
-    vm.sp = sp as usize;
-    match unsafe { vm.compare(cmp_kind(k), *a, *b) } {
-        Ok(r) => r as u64,
-        Err(e) => {
-            vm.jit_err = e;
-            2
-        }
-    }
-}
-
-/// Next item of the generator in loop state `*state` into `*out`:
-/// 1 = got one, 0 = exhausted (or not a generator), 2 = exception.
-extern "C" fn rt_gen_next(vm: &mut Vm, sp: u64, state: *const Value, out: *mut Value) -> u64 {
-    vm.sp = sp as usize;
-    let g = match unsafe { *state } {
-        Value::Obj(g) if matches!(g.get(), Obj::Generator(_)) => g,
-        _ => return 0,
-    };
-    match vm.resume_gen(g, Value::None) {
-        Ok(Some(v)) => {
-            unsafe { *out = v };
-            1
-        }
-        Ok(None) => 0,
-        Err(e) => {
-            vm.jit_err = e;
-            2
-        }
-    }
-}
-
-/// 0 / 1 = false / true, 2 = exception.
-extern "C" fn rt_truthy(vm: &mut Vm, sp: u64, a: *const Value) -> u64 {
-    vm.sp = sp as usize;
-    let v = unsafe { *a };
-    let r = match v {
-        Value::Obj(g) if matches!(g.get(), Obj::Instance(_)) => vm.truthy(v),
-        _ => Ok(v.truthy()),
-    };
-    match r {
-        Ok(r) => r as u64,
-        Err(e) => {
-            vm.jit_err = e;
-            2
-        }
-    }
-}
-
-extern "C" fn rt_neg(vm: &mut Vm, sp: u64, a: *const Value, out: *mut Value) -> u64 {
-    vm.sp = sp as usize;
-    let v = unsafe { *a };
-    let r = match dunder(v, sym::D_NEG) {
-        Some(m) => vm.call(m, &[v]),
-        None => ops::neg(v),
-    };
-    status(vm, r.map(|v| unsafe { *out = v }))
-}
-
-/// Runs an instruction the interpreter keeps out of line (`exec_cold`) on the
-/// frame's stack, finishing any call it starts.
-extern "C" fn rt_cold(vm: &mut Vm, sp: u64, op: *const Op) -> u64 {
-    vm.sp = sp as usize;
-    let depth = vm.frames.len();
-    let mut r = vm.exec_cold(unsafe { *op });
-    if r.is_ok() && vm.frames.len() > depth {
-        r = vm.run().map(|v| vm.spush(v));
-    }
-    status(vm, r)
-}
-
-/// `stack[callee](args)`: the result replaces the callee.
-extern "C" fn rt_call(vm: &mut Vm, callee: u64, argc: u64) -> u64 {
-    let (callee, argc) = (callee as usize, argc as usize);
-    vm.sp = callee + argc + 1;
-    if vm.heap.should_collect() {
-        vm.collect_garbage();
-    }
-    let r = match vm.call_value(callee, argc) {
-        Ok(true) => vm.run().map(|v| vm.stack[callee] = v),
-        Ok(false) => Ok(()),
-        Err(e) => Err(e),
-    };
-    status(vm, r)
-}
-
-/// `stack[recv].name(args)`: the result replaces the receiver. With an inline-cache
-/// cell, records the (class shape, method index) seen so compiled code can call
-/// the method directly next time.
-extern "C" fn rt_invoke(vm: &mut Vm, recv: u64, name: u64, argc: u64, cell: *mut u32) -> u64 {
-    let (recv, name, argc) = (recv as usize, name as u32, argc as usize);
-    vm.sp = recv + argc + 1;
-    if vm.heap.should_collect() {
-        vm.collect_garbage();
-    }
-    if !cell.is_null() {
-        if let Value::Obj(g) = vm.stack[recv] {
-            if let Obj::Instance(inst) = g.get() {
-                let cls = inst.class.as_class();
-                if !cls.slots.contains_key(&name) {
-                    if let Some(&midx) = cls.methods.get(&name) {
-                        unsafe {
-                            *cell = cls.id;
-                            *cell.add(1) = midx;
-                        }
+    /// Compiles `funcs` to machine code to be saved (`faston build`), without
+    /// installing it. One entry per function (`None`: left to the interpreter).
+    pub fn compile_aot(&mut self, vm: &mut Vm, funcs: &[Gc]) -> Vec<Option<AotFunc>> {
+        self.make_aot_isa();
+        let range_slot = vm.builtin_names.index.get("range").copied();
+        let mut out = Vec::with_capacity(funcs.len());
+        for &g in funcs {
+            let f = g.as_func();
+            if f.native_state != 0 {
+                out.push(None);
+                continue;
+            }
+            let Some(an) = self.analyze_fn(g, range_slot) else {
+                out.push(None);
+                continue;
+            };
+            let ops: Box<[Op]> = an.ops.clone().into_boxed_slice();
+            let cells: Box<[u32]> = vec![0u32; 2 * f.code.len()].into_boxed_slice();
+            let slots = self.build_ir(f, &an, &ops, &cells, true);
+            let isa = self.aot_isa.as_deref().unwrap();
+            let mut cp = cranelift_codegen::control::ControlPlane::default();
+            let code = match self.ctx.compile(isa, &mut cp) {
+                // saved code can't be relocated: anything referring outside itself is out
+                Ok(c) if c.buffer.relocs().is_empty() => Some(c.code_buffer().to_vec()),
+                _ => None,
+            };
+            self.ctx.clear();
+            match code {
+                Some(code) => {
+                    if self.debug {
+                        eprintln!("[jit] {}: {} bytes of saved machine code, {} table slots", f.name, code.len(), slots.len());
                     }
+                    set_state(g, 1);
+                    self.compiled += 1;
+                    out.push(Some(AotFunc { hash: hash_code(&f.code), code, slots }));
+                }
+                None => {
+                    if self.debug {
+                        eprintln!("[jit] {}: no saved code (code generation failed or needs relocation)", f.name);
+                    }
+                    set_state(g, 2);
+                    self.interpreted += 1;
+                    out.push(None);
                 }
             }
         }
-    }
-    let r = match vm.invoke(recv, name, argc) {
-        Ok(true) => vm.run().map(|v| vm.stack[recv] = v),
-        Ok(false) => Ok(()),
-        Err(e) => Err(e),
-    };
-    status(vm, r)
-}
-
-/// `*out = obj.name`, filling the inline-cache cell (class shape, field slot).
-extern "C" fn rt_getattr(vm: &mut Vm, sp: u64, obj: *const Value, name: u64, out: *mut Value, cell: *mut u32) -> u64 {
-    vm.sp = sp as usize;
-    let r = vm.load_attr(unsafe { *obj }, name as u32).map(|(v, cache)| {
-        if let Some((cid, slot)) = cache {
-            unsafe {
-                *cell = cid;
-                *cell.add(1) = slot;
-            }
-        }
-        unsafe { *out = v };
-    });
-    status(vm, r)
-}
-
-/// `obj.name = *v`, filling the inline-cache cell.
-extern "C" fn rt_setattr(vm: &mut Vm, sp: u64, obj: *const Value, name: u64, v: *const Value, cell: *mut u32) -> u64 {
-    vm.sp = sp as usize;
-    let r = vm.store_attr(unsafe { *obj }, name as u32, unsafe { *v }).map(|cache| {
-        if let Some((cid, slot)) = cache {
-            unsafe {
-                *cell = cid;
-                *cell.add(1) = slot;
-            }
-        }
-    });
-    status(vm, r)
-}
-
-extern "C" fn rt_getindex(vm: &mut Vm, sp: u64, obj: *const Value, idx: *const Value, out: *mut Value) -> u64 {
-    vm.sp = sp as usize;
-    let r = unsafe { vm.get_item(*obj, *idx) }.map(|v| unsafe { *out = v });
-    status(vm, r)
-}
-
-extern "C" fn rt_name_error(vm: &mut Vm, g: u64) -> u64 {
-    vm.jit_err = vm.name_error(g as u32);
-    ERR
-}
-
-extern "C" fn rt_setup_try(vm: &mut Vm, sp: u64, target: u64) -> u64 {
-    vm.handlers.push(Handler {
-        frames: vm.frames.len(),
-        sp: sp as usize,
-        target: target as u32,
-    });
-    OK
-}
-
-extern "C" fn rt_pop_try(vm: &mut Vm) -> u64 {
-    vm.handlers.pop();
-    OK
-}
-
-/// An exception reached compiled code: unwinds to this frame's innermost handler
-/// and returns its code index, or `u64::MAX` when the frame has none.
-extern "C" fn rt_catch(vm: &mut Vm, frame: *mut Frame) -> u64 {
-    let idx = (frame as usize - vm.frames.as_ptr() as usize) / std::mem::size_of::<Frame>();
-    let err = std::mem::take(&mut vm.jit_err);
-    match vm.handle_exception(err, idx) {
-        Ok(target) => target as u64,
-        Err(e) => {
-            vm.jit_err = e;
-            u64::MAX
-        }
-    }
-}
-
-extern "C" fn rt_gc(vm: &mut Vm, sp: u64) -> u64 {
-    vm.sp = sp as usize;
-    if vm.heap.should_collect() {
-        vm.collect_garbage();
-    }
-    OK
-}
-
-extern "C" fn rt_close(vm: &mut Vm, from: u64) -> u64 {
-    vm.close_upvalues(from as usize);
-    OK
-}
-
-/// Leaves compiled code: the interpreter finishes the call from instruction `ip`.
-extern "C" fn rt_deopt(vm: &mut Vm, frame: *mut Frame, ip: u64, sp: u64) -> u64 {
-    let ret = unsafe {
-        (*frame).ip = (*frame).code.add(ip as usize);
-        (*frame).ret
-    };
-    vm.sp = sp as usize;
-    let r = vm.interp().map(|v| vm.stack[ret] = v);
-    status(vm, r)
-}
-
-impl Vm {
-    /// Runs the top frame's native code (see `run`).
-    pub(super) fn run_native(&mut self, info: *const JitInfo) -> Result<Value, String> {
-        let fr = self.frames.last_mut().unwrap() as *mut Frame;
-        let ret = unsafe { (*fr).ret };
-        let st = unsafe { ((*info).entry)(self, fr) };
-        if st == OK {
-            self.sp = ret;
-            Ok(self.stack[ret])
-        } else {
-            let e = std::mem::take(&mut self.jit_err);
-            Err(self.record_exception(e))
-        }
-    }
-
-    /// Makes sure an error leaving compiled code has its exception object and its
-    /// traceback (taken while the failing frames are still on the frame stack).
-    fn record_exception(&mut self, err: String) -> String {
-        let exc = match self.exc.take() {
-            Some((v, m)) if m == err => v,
-            _ => self.make_exception(&err),
-        };
-        if let Value::Obj(g) = exc {
-            if self.trace_exc != Some(g) {
-                self.capture_trace();
-                self.trace_exc = Some(g);
-            }
-        }
-        self.exc = Some((exc, err.clone()));
-        err
-    }
-
-    /// (compiled, interpreted) function counts.
-    pub fn native_stats(&self) -> Option<(usize, usize)> {
-        self.jit.as_ref().map(|j| (j.compiled, j.interpreted))
+        out
     }
 }
 
@@ -753,19 +432,6 @@ fn cmp_parts(op: Op) -> Option<(CmpOp, Src, Src, CmpUse)> {
         Op::JumpIfNotGeLL(a, b, t) => (Ge, Local(a), Local(b), n(t)),
         _ => return None,
     })
-}
-
-/// The base form of an inline-cached instruction (compiled code has its own caches).
-fn canon(op: Op) -> Op {
-    match op {
-        Op::GetAttrIC(n, _, _) => Op::GetAttr(n),
-        Op::SetAttrIC(n, _, _) => Op::SetAttr(n),
-        Op::GetLocalAttrIC(n, _, packed) => Op::GetLocalAttr(packed & 0xffff, n),
-        Op::SetLocalAttrIC(n, _, packed) => Op::SetLocalAttr(packed & 0xffff, n),
-        Op::InvokeIC(name, _, packed) => Op::Invoke(name, packed & 0xff),
-        Op::InvokeAppend(name) => Op::Invoke(name, 1),
-        other => other,
-    }
 }
 
 fn const_ty(v: &Value) -> Ty {
@@ -1406,6 +1072,11 @@ struct Cg<'a> {
     cc: CallConv,
     ops_ptr: *const Op,
     cells: *const u32,
+    /// Ahead-of-time code: addresses come from the descriptor's table.
+    aot: bool,
+    table: V,
+    slots: Vec<Slot>,
+    slot_index: HashMap<Slot, usize>,
     nl: usize,
     vm: V,
     frame: V,
@@ -1434,6 +1105,7 @@ impl<'a> Cg<'a> {
         cc: CallConv,
         ops_ptr: *const Op,
         cells: *const u32,
+        aot: bool,
     ) -> Cg<'a> {
         let n = an.ops.len();
         let blocks = (0..n).map(|i| if an.leader[i] && an.states[i].is_some() { Some(b.create_block()) } else { None }).collect();
@@ -1443,7 +1115,8 @@ impl<'a> Cg<'a> {
         b.append_block_params_for_function_params(entry);
         b.switch_to_block(entry);
         let params = b.block_params(entry).to_vec();
-        let (vm, frame) = (params[0], params[1]);
+        let (vm, frame, info) = (params[0], params[1], params[2]);
+        let table = if aot { b.ins().load(I64, flags().with_readonly(), info, o.info_table) } else { info };
         let base_idx = b.ins().load(I64, flags(), frame, o.fr_base);
         let stack_ptr = b.ins().load(I64, flags(), vm, o.vm_stack_ptr);
         let off = b.ins().ishl_imm_s(base_idx, 4);
@@ -1487,6 +1160,10 @@ impl<'a> Cg<'a> {
             cc,
             ops_ptr,
             cells,
+            aot,
+            table,
+            slots: Vec::new(),
+            slot_index: HashMap::new(),
             nl: f.num_locals as usize,
             vm,
             frame,
@@ -1505,7 +1182,8 @@ impl<'a> Cg<'a> {
         }
     }
 
-    fn translate(mut self, frontend: cranelift_codegen::isa::TargetFrontendConfig) {
+    /// Emits the function; returns its address-table layout (ahead-of-time code).
+    fn translate(mut self, frontend: cranelift_codegen::isa::TargetFrontendConfig) -> Vec<Slot> {
         let first = self.blocks[0].unwrap();
         self.b.ins().jump(first, &[]);
         self.live = false;
@@ -1534,6 +1212,7 @@ impl<'a> Cg<'a> {
         self.emit_catch();
         self.b.seal_all_blocks();
         self.b.finalize(frontend);
+        self.slots
     }
 
     // ------------------------------------------------------------ small helpers
@@ -1569,15 +1248,37 @@ impl<'a> Cg<'a> {
     }
 
 
+    /// An address: an immediate, or (ahead-of-time code) read from the table.
+    fn addr(&mut self, s: Slot, real: i64) -> V {
+        if !self.aot {
+            return self.ic(real);
+        }
+        let k = match self.slot_index.get(&s) {
+            Some(&k) => k,
+            None => {
+                self.slots.push(s);
+                self.slot_index.insert(s, self.slots.len() - 1);
+                self.slots.len() - 1
+            }
+        };
+        self.b.ins().load(I64, flags().with_readonly(), self.table, (8 * k) as i32)
+    }
+
     fn cell(&mut self) -> V {
         let p = unsafe { self.cells.add(2 * self.i) } as i64;
-        self.ic(p)
+        self.addr(Slot::Cell(self.i as u32), p)
+    }
+
+    /// The pristine copy of the current instruction (for the runtime helpers).
+    fn op_ptr(&mut self) -> V {
+        let p = unsafe { self.ops_ptr.add(self.i) } as i64;
+        self.addr(Slot::Op(self.i as u32), p)
     }
 
     /// Publishes the current instruction (for tracebacks and the runtime).
     fn set_ip(&mut self) {
         let ip = unsafe { self.f.code.as_ptr().add(self.i + 1) } as i64;
-        let v = self.ic(ip);
+        let v = self.addr(Slot::Ip(self.i as u32 + 1), ip);
         self.sto(v, self.frame, self.o.fr_ip);
     }
 
@@ -1596,7 +1297,8 @@ impl<'a> Cg<'a> {
                 r
             }
         };
-        let fp = self.ic(f as i64);
+        let k = if self.aot { rt_fns().iter().position(|&a| a == f).expect("runtime helper missing from rt_fns") } else { 0 };
+        let fp = self.addr(Slot::Rt(k as u32), f as i64);
         let inst = self.b.ins().call_indirect(sig, fp, args);
         self.b.inst_results(inst)[0]
     }
@@ -1631,7 +1333,7 @@ impl<'a> Cg<'a> {
             Value::None => SV::N,
             Value::Obj(g) => {
                 let t = self.ic(tag::OBJ);
-                let p = self.ic(g.addr() as i64);
+                let p = self.addr(Slot::Const(k), g.addr() as i64);
                 SV::D(t, p)
             }
             Value::Undef => {
@@ -2337,7 +2039,7 @@ impl<'a> Cg<'a> {
         self.flush();
         self.set_ip();
         let sp = self.abs(self.stack.len());
-        let opp = self.ic(unsafe { self.ops_ptr.add(self.i) } as i64);
+        let opp = self.op_ptr();
         let st = self.call_rt(rt_cold as *const () as usize, &[self.vm, sp, opp]);
         self.check(st);
         self.reset_stack(op, pre);
@@ -2595,7 +2297,7 @@ impl Cg<'_> {
                 self.flush();
                 self.set_ip();
                 let sp = self.abs(d);
-                let opp = self.ic(unsafe { self.ops_ptr.add(self.i) } as i64);
+                let opp = self.op_ptr();
                 self.call_rt(rt_cold as *const () as usize, &[self.vm, sp, opp]);
                 self.b.ins().jump(self.catch, &[]);
                 self.live = false;
@@ -2859,26 +2561,6 @@ impl Cg<'_> {
     }
 }
 
-// ---------------------------------------------------------------------------- inline caches & calls
-
-/// A fresh instance of class `cls` into `*out` (the constructor's frame slot).
-extern "C" fn rt_new_instance(vm: &mut Vm, cls: u64, out: *mut Value) -> u64 {
-    let g: Gc = unsafe { std::mem::transmute::<u64, Gc>(cls) };
-    let n = g.as_class().slot_count as usize;
-    let inst = vm.heap.alloc(Obj::Instance(Instance::new(g, vec![Value::Undef; n])));
-    unsafe { *out = Value::Obj(inst) };
-    OK
-}
-
-/// `list.append(v)` from the `Invoke` fast path.
-extern "C" fn rt_list_push(_vm: &mut Vm, list: u64, v: *const Value) -> u64 {
-    let g: Gc = unsafe { std::mem::transmute::<u64, Gc>(list) };
-    if let Obj::List(l) = g.get_mut() {
-        l.push(unsafe { *v });
-    }
-    OK
-}
-
 impl Cg<'_> {
     /// Branches to `yes` if (t, p) is an instance whose class shape matches this
     /// instruction's cache cell; passes (class ptr) along. Otherwise to `no`.
@@ -3081,7 +2763,7 @@ impl Cg<'_> {
         self.spill();
         self.set_ip();
         let sp = self.abs(d);
-        let opp = self.ic(unsafe { self.ops_ptr.add(self.i) } as i64);
+        let opp = self.op_ptr();
         let st = self.call_rt(rt_cold as *const () as usize, &[self.vm, sp, opp]);
         self.check(st);
         self.b.ins().jump(done, &[]);
@@ -3169,22 +2851,23 @@ impl Cg<'_> {
         self.sto(n1, self.vm, self.o.vm_frames_len);
         let entry = self.ld(info, self.o.info_entry);
         let sig = self.entry_sig();
-        let inst = self.b.ins().call_indirect(sig, entry, &[self.vm, fr]);
+        let inst = self.b.ins().call_indirect(sig, entry, &[self.vm, fr, info]);
         let st = self.b.inst_results(inst)[0];
         self.b.ins().brif(st, self.catch, &[], done, &[]);
     }
 
     fn entry_sig(&mut self) -> SigRef {
-        // same shape as a two-argument runtime helper
-        match self.sigs.get(&2) {
+        // same shape as a three-argument runtime helper
+        match self.sigs.get(&3) {
             Some(&s) => s,
             None => {
                 let mut s = Signature::new(self.cc);
-                s.params.push(AbiParam::new(I64));
-                s.params.push(AbiParam::new(I64));
+                for _ in 0..3 {
+                    s.params.push(AbiParam::new(I64));
+                }
                 s.returns.push(AbiParam::new(I64));
                 let r = self.b.import_signature(s);
-                self.sigs.insert(2, r);
+                self.sigs.insert(3, r);
                 r
             }
         }

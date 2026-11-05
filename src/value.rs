@@ -306,7 +306,7 @@ pub struct Function {
     /// Has `**kwargs` (a dict in the slot after that).
     pub varkw: bool,
     /// Native code for this function (null until the compiler has built it).
-    pub jit: *const crate::vm::jit::JitInfo,
+    pub jit: *const crate::vm::jit_rt::JitInfo,
     /// 0 = not compiled yet, 1 = compiled, 2 = left to the interpreter.
     pub native_state: u8,
 }
@@ -589,7 +589,7 @@ pub mod sym {
 
 pub struct Interner {
     map: HashMap<String, u32>,
-    names: Vec<String>,
+    pub(crate) names: Vec<String>,
 }
 
 impl Default for Interner {
