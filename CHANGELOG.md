@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.1
+
+- Compiled modules (`name.fbc`) count as importable modules
+- f-string conversions (`{x!r}`, `!s`, `!a`) and `ascii()`
+- `**rest` captures in mapping patterns
+
 ## 0.4.0
 
 - `match` / `case` statements: highlighting, hover docs, completions; capture
