@@ -63,8 +63,10 @@ cargo build --release
 ./target/release/faston run --native game.fst # compile to machine code and run now
 ./target/release/faston game.fst              # run in the interpreter (instant start)
 ./target/release/faston                       # interactive prompt (interpreter)
-./target/release/faston --dis file.fst        # show the bytecode
-cargo test --release                          # test suite (interpreted + native)
+./target/release/faston --dis file.fst        # show the bytecode (also of a .fbc file)
+./target/release/faston compile game.fst      # -> game.fbc, a bytecode file
+./target/release/faston game.fbc              # run a bytecode file
+cargo test --release                          # tests: interpreted, native, built, .fbc
 tests/native.sh                               # quick native-only test run
 python3 tests/fuzz.py 500                     # differential fuzzing vs CPython
 FASTON_NATIVE=1 python3 tests/fuzz.py 500     # ...with native code
@@ -284,6 +286,46 @@ flags and tile masks.
 - `x is None`, `a is not b`; `del name`, `del d[key]`, `del xs[1:3]`,
   `del obj.attr`; slice assignment `xs[1:3] = [7, 8, 9]`
 
+**Pattern matching.** `match` works like Python's: literals, captures, `_`,
+sequences with `*rest`, mappings, class patterns (positional sub-patterns use
+`__match_args__`, or by default `init`'s parameters), alternatives with `|`,
+`as`, and `if` guards. The first matching `case` runs; if none matches,
+nothing happens. Capture names are local to their `case`.
+
+```faston
+match (command) {
+    case ["go", direction] { move(direction); }
+    case ["take", *items] if len(items) > 0 { take(items); }
+    case {"action": "say", "text": text} { print(text); }
+    case Point(x, 0) | Point(0, x) { print("on an axis at", x); }
+    case int(n) | float(n) { print("a number", n); }
+    case _ { print("unknown command"); }
+}
+```
+
+`match` and `case` are only keywords there, so variables named `match` keep
+working.
+
+**Enums.** Members have `name` and `value`; members without a value count up
+from 1 (or from the previous value). Enums can have methods, compare by
+identity, work as dict keys, and `Color(2)` finds a member by value. The
+Python spelling works too: `from enum import Enum, auto;` and
+`class Color(Enum) { RED = auto(); }`.
+
+```faston
+enum Color { RED, GREEN, BLUE = 10 }
+print(Color.RED, Color.RED.value, Color(10), list(Color), len(Color));
+match (c) { case Color.RED { stop(); } case Color.GREEN | Color.BLUE { go(); } }
+```
+
+**Bytes.** `b"..."` literals (with `\x..` escapes; `rb"..."` raw), `bytes` and
+the mutable `bytearray`, with indexing (ints), slicing, `+`, `*`, `in`,
+`hex()`, `bytes.fromhex()`, `split`, `join`, `replace`, `find`, `strip`, ...
+Text converts with `s.encode()` / `b.decode()` (utf-8, ascii, latin-1, with
+`errors="replace"` / `"ignore"`), ints with `n.to_bytes(4, "little")` /
+`int.from_bytes(b, "big", signed=True)`. Files opened with `"rb"` / `"wb"`
+read and write bytes.
+
 **Generators.** A function containing `yield` returns a generator; `for`
 loops, `list()`, `sum()`, `next()`, `in` and friends consume it lazily, so
 infinite generators work. `yield from it;` yields everything from another
@@ -439,6 +481,28 @@ is a repository with an `__init__.fst` at its root (`faston new NAME --lib`
 makes one). `faston build` bundles every module and package the program
 imports.
 
+### Bytecode files
+
+`faston compile game.fst` writes `game.fbc`, the compiled module, which
+`faston game.fbc` runs without compiling (it imports `.fst` modules as usual).
+From Faston, the `bytecode` module does the same, and also accepts bytecode
+made some other way, for example by a compiler written in Faston:
+
+```faston
+import bytecode;
+let code = bytecode.compile("print('hi from bytecode');");
+bytecode.load(code)();            # a function that runs the module
+let m = bytecode.run(code);       # or run it and get the module back
+print(bytecode.opcodes["Add"], bytecode.operands["JumpIfNotLtLC"]);
+print(bytecode.dis(code));
+```
+
+Loading checks every instruction: operands in range, jump targets, captured
+variables, and that the stack depth is the same on every path, so a broken
+file raises `ValueError` instead of crashing. The format is documented at
+the top of `src/fbc.rs`; the opcode table (numbers and operand kinds) is in
+`src/bytecode.rs`, and new instructions are only ever added at the end.
+
 ### GUI
 
 `gui.run(draw)` opens a window and calls `draw(ui)` every frame (egui's
@@ -487,7 +551,7 @@ TypeError: unsupported operand type(s) for +: 'str' and 'int'
 
 ### Differences from Python (current limitations)
 
-- No `async`, no `match`, no binary files / `bytes` yet.
+- No `async` yet. f-strings don't support `!r` conversions (use `repr()`).
 - Generator expressions in parentheses are only allowed as call arguments
   (`sum(x * x for x in xs)`), and are evaluated eagerly.
 - Generator functions run in the interpreter even in native mode (the code
@@ -590,6 +654,8 @@ src/
   jit.rs        native code generator: type inference, Cranelift IR (also for `faston build`)
   jit_rt.rs     what compiled code needs at run time: helpers, loading saved machine code
   bundle.rs     `faston build`: standalone executables
+  fbc.rs        bytecode files: format, loader + verifier, the `bytecode` module
+  bytesmod.rs   bytes, bytearray, text encodings
   value.rs      Value, heap objects, garbage collector, dicts
   ops.rs        operator semantics (Python-compatible)
   builtins.rs   built-in functions, methods, math/random/time
@@ -621,8 +687,9 @@ bench/          benchmarks with CPython equivalents
 
 An embedding API so a game engine (Rust, C, or a Tauri/JS host) can run Faston
 scripts and register its own functions (`Vm::call` and native functions already
-exist internally); a package manager and import search path; `bytes` and
-binary files; `subprocess`, `datetime`, `re`, networking; native file dialogs
-for the gui; arbitrary-size integers. For the native compiler: type feedback (record the types each
-operation actually sees, then compile a specialized version), unboxed float
-fields, and caching compiled code inside built executables.
+exist internally); a compiler written in Faston (bootstrapping: the bytecode
+format and the `bytecode` module are the pieces it needs); importing `.fbc`
+modules; networking; native file dialogs for the gui; arbitrary-size
+integers; `async`. For the native compiler: type feedback (record the types
+each operation actually sees, then compile a specialized version) and unboxed
+float fields.

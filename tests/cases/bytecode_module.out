@@ -1,0 +1,13 @@
+bytes b'FSTNBC' b'FSTNBC' 1
+ran 49
+ran 49
+49 25
+3
+LKT True True
+ValueError: bad bytecode: count larger than the file
+ValueError: bad bytecode: not a Faston bytecode file
+ValueError: bad bytecode: extra data after the module
+ValueError: bad bytecode: <module>: instruction 7: Jump(99): operand out
+ValueError: bad bytecode: <module>: instruction 0: Add: stack underflow
+ValueError: bad bytecode: <module>: instruction 3: stack depth 0 here on one path, 1 on another
+== <module> (arity 0, locals 0, stack 5) ==

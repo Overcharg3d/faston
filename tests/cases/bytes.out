@@ -1,0 +1,34 @@
+b'hello\x00\xffworld' 12 104 100 255
+b'ell' b'dlr' bytes True False
+b'abcd' b'ababab' True True False
+True True False
+[65, 90] [2, 4]
+b'\x00\x00\x00' b'ABC' b'h\xc3\xa9llo' b'\x00\x01\x02'
+b'a\\nb' b'\\x00' b'x' b"it's" b'say "hi"'
+b'\t\n\r\\' b'\x7f\x80'
+b'The quick brown fox' b'The quick brown fox  ' b'  The quick brown fox' b'hi'
+[b'The', b'quick', b'brown', b'fox'] [b'a', b'b', b'', b'c'] [b'a', b'b c']
+b'a-b-c' b'bbbbbb' b'bba'
+2 3 -1 3
+2 2 True True
+b'HELLO' b'hello' True True True
+deadbeef b'\xde\xad\xbe\xef' bytearray(b'\x00\x01')
+b'h\xc3\xa9llo \xe2\x82\xac' b'abc' b'caf\xe9'
+héllo abc café
+bad � byte bad  byte
+b'?' b''
+UnicodeDecodeError: 'utf-8' codec can't decode byte 0xff in position 0: invalid start byte
+UnicodeEncodeError: 'ascii' codec can't encode character '\xe9' in position 0: ordinal not in range(128)
+bytearray(b'bcdefg') 8 104 65 bytearray(b'bcdefg')
+bytearray(b'gfedcb') b'gfedcb' True bytearray(b'gfedcb!') bytearray
+bytearray(b'\x00\xff') 00ff
+ValueError: byte must be in range(0, 256)
+TypeError: 'bytes' object does not support item assignment
+b'\x04\x00' b'\x00\x04' b'\xff' b'\xff\xfe'
+1024 4 -2
+256 9 0
+OverflowError: int too big to convert
+1 True 2
+True True False True True True
+TypeError: unhashable type: 'bytearray'
+Aé😀 True

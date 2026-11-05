@@ -1,0 +1,42 @@
+zero
+small
+minus one
+greeting
+nothing
+small
+empty list
+one item: 9
+starts with 0, then [1, 2]
+1..4
+5..6
+5..7
+user ann
+id 7
+something else
+origin
+on the x axis at 3
+diagonal 4
+point 1,2
+big circle
+circle 2
+big int
+some int
+string 'abc'
+float 2.5
+something else
+move to 1 2
+line from x 1 to 2
+bye
+match variable 5
+Color.RED <Color.GREEN: 2> BLUE 3
+[<Color.RED: 1>, <Color.GREEN: 2>, <Color.BLUE: 3>] 3 True Color.GREEN Status.NOT_FOUND
+True [<Status.OK: 200>, <Status.NOT_FOUND: 404>] True True
+True Color True False
+RED 1
+GREEN 2
+BLUE 3
+go
+ValueError: 9 is not a valid Color
+stop go
+[<Weekday.MONDAY: 1>, <Weekday.TUESDAY: 2>, <Weekday.FRIDAY: 5>, <Weekday.SATURDAY: 6>] True False
+still a name

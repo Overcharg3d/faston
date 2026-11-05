@@ -805,6 +805,37 @@ impl Ctx<'_> {
                     pop!();
                 }
             }
+            Op::MatchSeq(..) | Op::MatchMap => {
+                pop!();
+                push!(Ty::Bool);
+            }
+            Op::MatchRest(..) => {
+                pop!();
+                push!(Ty::Any);
+            }
+            Op::MatchClass => {
+                pop!();
+                pop!();
+                push!(Ty::Bool);
+            }
+            // these write a local from the runtime: keep it in memory
+            Op::MatchKey(d) | Op::MatchArg(_, d) => {
+                pop!();
+                pop!();
+                push!(Ty::Bool);
+                local!(d);
+                u(Use::Write(d, Ty::Any));
+                u(Use::Pin(d));
+                st.locals[d as usize] = Ty::Any;
+            }
+            Op::MatchAttr(_, d) => {
+                pop!();
+                push!(Ty::Bool);
+                local!(d);
+                u(Use::Write(d, Ty::Any));
+                u(Use::Pin(d));
+                st.locals[d as usize] = Ty::Any;
+            }
             // Gen / Yield: generator functions stay in the interpreter
             _ => return None,
         }
@@ -2333,7 +2364,14 @@ impl Cg<'_> {
             | Op::DelAttr(_)
             | Op::DelGlobal(_)
             | Op::SetSlice
-            | Op::DelSlice => self.cold(op, pre),
+            | Op::DelSlice
+            | Op::MatchSeq(..)
+            | Op::MatchRest(..)
+            | Op::MatchMap
+            | Op::MatchKey(_)
+            | Op::MatchClass
+            | Op::MatchArg(..)
+            | Op::MatchAttr(..) => self.cold(op, pre),
             other => unreachable!("instruction {:?} reached the code generator", other),
         }
     }

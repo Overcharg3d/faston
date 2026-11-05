@@ -124,6 +124,8 @@ pub mod kind {
     pub const SET: u8 = 13;
     pub const HANDLE: u8 = 14;
     pub const GENERATOR: u8 = 15;
+    pub const BYTES: u8 = 16;
+    pub const BYTEARRAY: u8 = 17;
 }
 
 impl Obj {
@@ -145,6 +147,8 @@ impl Obj {
             Obj::Set(_) => kind::SET,
             Obj::Handle(_) => kind::HANDLE,
             Obj::Generator(_) => kind::GENERATOR,
+            Obj::Bytes(_) => kind::BYTES,
+            Obj::ByteArray(_) => kind::BYTEARRAY,
         }
     }
 }
@@ -236,6 +240,10 @@ pub enum Obj {
     /// Native resource (file, GUI object, ...).
     Handle(Box<Handle>),
     Generator(Box<Generator>),
+    /// Immutable byte string (`b"..."`).
+    Bytes(Vec<u8>),
+    /// Mutable byte string.
+    ByteArray(Vec<u8>),
 }
 
 /// A function together with the variables it captured from enclosing functions.
@@ -558,6 +566,20 @@ pub mod sym {
     pub const EXPANDTABS: u32 = 120;
     pub const ISASCII: u32 = 121;
     pub const KEEPENDS: u32 = 122;
+    pub const DECODE: u32 = 123;
+    pub const ENCODE: u32 = 124;
+    pub const TO_BYTES: u32 = 126;
+    pub const FROM_BYTES: u32 = 127;
+    pub const FROMHEX: u32 = 128;
+    pub const BYTEORDER: u32 = 129;
+    pub const SIGNED: u32 = 130;
+    pub const LENGTH: u32 = 131;
+    pub const ERRORS: u32 = 132;
+    pub const BIT_LENGTH: u32 = 133;
+    pub const D_MATCH_ARGS: u32 = 134;
+    pub const NAME: u32 = 135;
+    pub const VALUE: u32 = 136;
+    pub const D_MEMBERS: u32 = 137;
 
     /// In a native's keyword list: accept any keyword (the native reads them itself).
     pub const ANY: u32 = u32::MAX;
@@ -584,6 +606,8 @@ pub mod sym {
         "__enter__", "__exit__", "__next__", "__delitem__",
         "file", "flush", "indent", "sort_keys", "encoding", "mode", "exist_ok", "expandtabs",
         "isascii", "keepends",
+        "decode", "encode", "hex", "to_bytes", "from_bytes", "fromhex", "byteorder", "signed",
+        "length", "errors", "bit_length", "__match_args__", "name", "value", "__members__",
     ];
 }
 
@@ -705,6 +729,14 @@ impl Heap {
         Value::Obj(self.alloc(Obj::Set(Box::new(d))))
     }
 
+    pub fn bytes(&mut self, b: Vec<u8>) -> Value {
+        Value::Obj(self.alloc(Obj::Bytes(b)))
+    }
+
+    pub fn bytearray(&mut self, b: Vec<u8>) -> Value {
+        Value::Obj(self.alloc(Obj::ByteArray(b)))
+    }
+
     #[inline(always)]
     pub fn should_collect(&self) -> bool {
         self.since_gc >= self.threshold
@@ -730,7 +762,7 @@ impl Heap {
     pub fn finish_collection(&mut self) {
         while let Some(g) = self.gray.pop() {
             match g.get() {
-                Obj::Str(_) | Obj::Range(_) | Obj::Native(_) | Obj::Handle(_) => {}
+                Obj::Str(_) | Obj::Range(_) | Obj::Native(_) | Obj::Handle(_) | Obj::Bytes(_) | Obj::ByteArray(_) => {}
                 Obj::List(v) => {
                     for x in v.iter() {
                         self.mark(*x);
@@ -843,6 +875,7 @@ pub enum Key {
     Ptr(usize),
     /// A tuple whose items are all hashable (checked when the key is made).
     Tuple(Gc),
+    Bytes(Gc),
 }
 
 impl Key {
@@ -850,6 +883,13 @@ impl Key {
         match g.get() {
             Obj::Str(s) => s.as_str(),
             _ => "",
+        }
+    }
+
+    fn bytes_of(g: Gc) -> &'static [u8] {
+        match g.get() {
+            Obj::Bytes(b) => b,
+            _ => &[],
         }
     }
 
@@ -869,6 +909,7 @@ impl PartialEq for Key {
             (Key::Float(a), Key::Float(b)) => a == b,
             (Key::Str(a), Key::Str(b)) => a == b || Key::str_of(*a) == Key::str_of(*b),
             (Key::Ptr(a), Key::Ptr(b)) => a == b,
+            (Key::Bytes(a), Key::Bytes(b)) => a == b || Key::bytes_of(*a) == Key::bytes_of(*b),
             (Key::Tuple(a), Key::Tuple(b)) => {
                 let (x, y) = (Key::items_of(*a), Key::items_of(*b));
                 a == b
@@ -905,6 +946,10 @@ impl Hash for Key {
                 h.write_u8(4);
                 h.write_usize(*p);
             }
+            Key::Bytes(g) => {
+                h.write_u8(6);
+                Key::bytes_of(*g).hash(h);
+            }
             Key::Tuple(g) => {
                 h.write_u8(5);
                 for x in Key::items_of(*g) {
@@ -931,6 +976,7 @@ pub fn to_key(v: Value) -> Result<Key, String> {
         }
         Value::Obj(g) => match g.get() {
             Obj::Str(_) => Key::Str(g),
+            Obj::Bytes(_) => Key::Bytes(g),
             Obj::Func(_) | Obj::Native(_) | Obj::Class(_) | Obj::Instance(_) | Obj::Closure(_)
             | Obj::Module(_) | Obj::Handle(_) | Obj::Generator(_) => Key::Ptr(g.addr()),
             Obj::Tuple(t) => {
@@ -1005,6 +1051,18 @@ impl Value {
         }
     }
 
+    /// Contents of a `bytes` or `bytearray`.
+    #[inline]
+    pub fn as_bytes<'a>(self) -> Option<&'a [u8]> {
+        match self {
+            Value::Obj(g) => match g.get() {
+                Obj::Bytes(b) | Obj::ByteArray(b) => Some(b.as_slice()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     pub fn type_name(&self) -> String {
         match self {
             Value::Undef => "undefined".into(),
@@ -1028,6 +1086,8 @@ impl Value {
                 Obj::Upvalue(_) => "upvalue".into(),
                 Obj::Module(_) => "module".into(),
                 Obj::Handle(h) => h.ty.name.into(),
+                Obj::Bytes(_) => "bytes".into(),
+                Obj::ByteArray(_) => "bytearray".into(),
                 Obj::Generator(gen) => match gen.kind {
                     GenKind::Frame { .. } => "generator".into(),
                     GenKind::Seq { .. } | GenKind::Next { .. } => "iterator".into(),
@@ -1048,6 +1108,7 @@ impl Value {
                 Obj::List(l) => !l.is_empty(),
                 Obj::Dict(d) | Obj::Set(d) => d.len() != 0,
                 Obj::Tuple(t) => !t.is_empty(),
+                Obj::Bytes(b) | Obj::ByteArray(b) => !b.is_empty(),
                 Obj::Range(r) => r.len() != 0,
                 _ => true,
             },
@@ -1192,6 +1253,12 @@ impl Value {
                     let _ = write!(out, "<module '{}'>", m.name);
                 }
                 Obj::Handle(h) => out.push_str(&(h.ty.repr)(h)),
+                Obj::Bytes(b) => write_bytes_repr(out, b),
+                Obj::ByteArray(b) => {
+                    out.push_str("bytearray(");
+                    write_bytes_repr(out, b);
+                    out.push(')');
+                }
                 Obj::Generator(gen) => match &gen.kind {
                     GenKind::Frame { owner, .. } => {
                         let _ = write!(out, "<generator object {}>", callable_name(*owner));
@@ -1473,4 +1540,28 @@ pub fn check_value_encoding() {
     assert_eq!(words(Value::Float(1.5)), [tag::FLOAT as u64, 1.5f64.to_bits()]);
     let g = Gc(NonNull::dangling());
     assert_eq!(words(Value::Obj(g)), [tag::OBJ as u64, g.addr() as u64]);
+}
+
+/// `b'...'`: printable ASCII as is, other bytes as escapes (like Python).
+pub fn write_bytes_repr(out: &mut String, b: &[u8]) {
+    let q = if b.contains(&b'\'') && !b.contains(&b'"') { b'"' } else { b'\'' };
+    out.push('b');
+    out.push(q as char);
+    for &c in b {
+        match c {
+            b'\n' => out.push_str("\\n"),
+            b'\t' => out.push_str("\\t"),
+            b'\r' => out.push_str("\\r"),
+            b'\\' => out.push_str("\\\\"),
+            c if c == q => {
+                out.push('\\');
+                out.push(c as char);
+            }
+            0x20..=0x7e => out.push(c as char),
+            c => {
+                let _ = write!(out, "\\x{:02x}", c);
+            }
+        }
+    }
+    out.push(q as char);
 }

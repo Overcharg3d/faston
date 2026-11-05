@@ -59,6 +59,38 @@ fn seq_of<'a>(v: Value) -> Option<&'a [Value]> {
     }
 }
 
+/// Contents of a bytes / bytearray, and whether it is a bytearray.
+fn bytes_of<'a>(v: Value) -> Option<(&'a [u8], bool)> {
+    match v {
+        Value::Obj(g) => match g.get() {
+            Obj::Bytes(b) => Some((b, false)),
+            Obj::ByteArray(b) => Some((b, true)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// A new bytes, or bytearray if `mutable`.
+pub fn new_bytes(heap: &mut Heap, b: Vec<u8>, mutable: bool) -> Value {
+    if mutable { heap.bytearray(b) } else { heap.bytes(b) }
+}
+
+/// The members of an enum class (each once, in definition order).
+pub fn enum_members(v: Value) -> Option<Vec<Value>> {
+    let Value::Obj(g) = v else { return None };
+    let Obj::Class(c) = g.get() else { return None };
+    let Value::Obj(d) = c.method(sym::D_MEMBERS)? else { return None };
+    let Obj::Dict(d) = d.get() else { return None };
+    let mut out: Vec<Value> = Vec::new();
+    for (_, m) in d.entries.iter() {
+        if !out.iter().any(|x| matches!((x, m), (Value::Obj(a), Value::Obj(b)) if a == b)) {
+            out.push(*m);
+        }
+    }
+    Some(out)
+}
+
 pub fn set_of<'a>(v: Value) -> Option<&'a Dict> {
     match v {
         Value::Obj(g) => match g.get() {
@@ -113,6 +145,12 @@ pub fn add(heap: &mut Heap, a: Value, b: Value) -> R {
         v.extend_from_slice(y);
         return Ok(heap.list(v));
     }
+    if let (Some((x, m)), Some((y, _))) = (bytes_of(a), bytes_of(b)) {
+        let mut v = Vec::with_capacity(x.len() + y.len());
+        v.extend_from_slice(x);
+        v.extend_from_slice(y);
+        return Ok(new_bytes(heap, v, m));
+    }
     if let (Some(x), Some(y)) = (tuple_of(a), tuple_of(b)) {
         let mut v = Vec::with_capacity(x.len() + y.len());
         v.extend_from_slice(x);
@@ -158,6 +196,9 @@ pub fn mul(heap: &mut Heap, a: Value, b: Value) -> R {
     };
     if let Some(s) = seq.as_str() {
         return Ok(heap.string(s.repeat(repeat_count(n))));
+    }
+    if let Some((b, m)) = bytes_of(seq) {
+        return Ok(new_bytes(heap, b.repeat(repeat_count(n)), m));
     }
     if let Some(l) = list_of(seq) {
         let times = repeat_count(n);
@@ -375,6 +416,9 @@ pub fn compare(a: Value, b: Value, op: &str) -> Result<Option<Ordering>, String>
     if let (Some(x), Some(y)) = (a.as_str(), b.as_str()) {
         return Ok(Some(x.cmp(y)));
     }
+    if let (Some((x, _)), Some((y, _))) = (bytes_of(a), bytes_of(b)) {
+        return Ok(Some(x.cmp(y)));
+    }
     let same_kind = matches!((list_of(a), list_of(b)), (Some(_), Some(_)))
         || matches!((tuple_of(a), tuple_of(b)), (Some(_), Some(_)));
     if same_kind {
@@ -438,6 +482,7 @@ pub fn equals(a: Value, b: Value) -> bool {
                         })
                 }
                 (Obj::Range(p), Obj::Range(q)) => p == q,
+                (Obj::Bytes(p) | Obj::ByteArray(p), Obj::Bytes(q) | Obj::ByteArray(q)) => p == q,
                 (Obj::Bound(p), Obj::Bound(q)) => equals(p.recv, q.recv) && p.method == q.method,
                 _ => false,
             }
@@ -470,6 +515,24 @@ pub fn contains(container: Value, item: Value) -> Result<bool, String> {
                 }
             }
             Obj::Dict(d) => return Ok(d.contains(&to_key(item)?)),
+            Obj::Class(_) if enum_members(container).is_some() => {
+                return Ok(enum_members(container).unwrap().iter().any(|m| equals(*m, item)));
+            }
+            Obj::Bytes(b) | Obj::ByteArray(b) => {
+                if let Some(i) = int_like(item) {
+                    if !(0..=255).contains(&i) {
+                        return Err("ValueError: byte must be in range(0, 256)".into());
+                    }
+                    return Ok(b.contains(&(i as u8)));
+                }
+                return match item.as_bytes() {
+                    Some(sub) => Ok(sub.is_empty() || b.windows(sub.len()).any(|w| w == sub)),
+                    None => Err(format!(
+                        "TypeError: a bytes-like object is required, not '{}'",
+                        item.type_name()
+                    )),
+                };
+            }
             Obj::Range(r) => {
                 return Ok(match int_like(item) {
                     Some(i) => {
@@ -545,6 +608,12 @@ pub fn get_index(heap: &mut Heap, obj: Value, idx: Value) -> R {
                 let key = to_key(idx)?;
                 return d.get(&key).ok_or_else(|| format!("KeyError: {}", idx.repr()));
             }
+            Obj::Bytes(b) | Obj::ByteArray(b) => {
+                let i = index_int(idx, "byte")?;
+                return norm_index(i, b.len())
+                    .map(|i| Value::Int(b[i] as i64))
+                    .ok_or_else(|| "IndexError: index out of range".into());
+            }
             Obj::Range(r) => {
                 let i = index_int(idx, "range")?;
                 return norm_index(i, r.len() as usize)
@@ -575,6 +644,26 @@ pub fn set_index(obj: Value, idx: Value, val: Value) -> Result<(), String> {
                 let key = to_key(idx)?;
                 d.insert(key, idx, val);
                 return Ok(());
+            }
+            Obj::ByteArray(b) => {
+                let i = index_int(idx, "bytearray")?;
+                let v = match int_like(val) {
+                    Some(v) if (0..=255).contains(&v) => v as u8,
+                    Some(_) => return Err("ValueError: byte must be in range(0, 256)".into()),
+                    None => {
+                        return Err(format!(
+                            "TypeError: '{}' object cannot be interpreted as an integer",
+                            val.type_name()
+                        ))
+                    }
+                };
+                return match norm_index(i, b.len()) {
+                    Some(i) => {
+                        b[i] = v;
+                        Ok(())
+                    }
+                    None => Err("IndexError: bytearray index out of range".into()),
+                };
             }
             _ => {}
         }
@@ -607,6 +696,12 @@ pub fn to_vec(heap: &mut Heap, v: Value) -> Result<Vec<Value>, String> {
                 return Ok(chars.into_iter().map(|c| heap.string(c.to_string())).collect());
             }
             Obj::Dict(d) => return Ok(d.entries.iter().map(|(k, _)| *k).collect()),
+            Obj::Bytes(b) | Obj::ByteArray(b) => return Ok(b.iter().map(|&x| Value::Int(x as i64)).collect()),
+            Obj::Class(_) => {
+                if let Some(m) = enum_members(v) {
+                    return Ok(m);
+                }
+            }
             _ => {}
         }
     }
@@ -681,6 +776,11 @@ pub fn slice(heap: &mut Heap, obj: Value, start: Value, stop: Value, step: Value
             Obj::Tuple(t) => {
                 let v = indices(t.len()).into_iter().map(|i| t[i]).collect();
                 return Ok(heap.tuple(v));
+            }
+            Obj::Bytes(b) | Obj::ByteArray(b) => {
+                let v: Vec<u8> = indices(b.len()).into_iter().map(|i| b[i]).collect();
+                let m = matches!(g.get(), Obj::ByteArray(_));
+                return Ok(new_bytes(heap, v, m));
             }
             Obj::Str(s) => {
                 if s.is_ascii() && step == 1 {

@@ -763,6 +763,16 @@ impl<'g> Compiler<'g> {
                 self.emit(Op::Pop);
                 Ok(())
             }
+            Tok::Ident(s) if s == "match" && self.is_match_start() => self.match_stmt(),
+            Tok::Ident(s)
+                if s == "enum"
+                    && matches!(self.toks[self.pos + 1].tok, Tok::Ident(_))
+                    && self.toks[self.pos + 2].tok == Tok::LBrace =>
+            {
+                self.advance();
+                let name = self.class_value(true)?;
+                self.define_named(&name)
+            }
             Tok::Ident(_) if self.toks[self.pos + 1].tok == Tok::Comma => self.multi_assign(),
             Tok::Pass => {
                 self.advance();
@@ -951,6 +961,7 @@ impl<'g> Compiler<'g> {
             Tok::Int(i) => Value::Int(if neg { -i } else { i }),
             Tok::Float(f) => Value::Float(if neg { -f } else { f }),
             Tok::Str(s) if !neg => self.heap.string(s),
+            Tok::Bytes(b) if !neg => self.heap.bytes(b),
             Tok::True if !neg => Value::Bool(true),
             Tok::False if !neg => Value::Bool(false),
             Tok::None if !neg => Value::None,
@@ -1111,6 +1122,18 @@ impl<'g> Compiler<'g> {
                     }
                     continue;
                 }
+                // enum bodies hold members, not assignments
+                Tok::Ident(e)
+                    if stmt_start
+                        && e == "enum"
+                        && matches!(self.toks[i + 1].tok, Tok::Ident(_))
+                        && self.toks[i + 2].tok == Tok::LBrace =>
+                {
+                    i += 2;
+                    i = self.skip_braces(i)?;
+                    stmt_start = true;
+                    continue;
+                }
                 Tok::Ident(first) if stmt_start => {
                     let mut group = vec![first.clone()];
                     let mut j = i + 1;
@@ -1263,27 +1286,55 @@ impl<'g> Compiler<'g> {
 
     fn class_decl(&mut self) -> Res<()> {
         self.advance();
-        let name = self.class_value()?;
+        let name = self.class_value(false)?;
         self.define_named(&name)
     }
 
-    /// `class Name(Base) { ... }` after the `class` keyword: leaves the class on the
-    /// stack and returns its name.
-    fn class_value(&mut self) -> Res<String> {
-        let name = self.expect_ident("expected class name after 'class'")?;
+    /// `class Name(Base) { ... }` after the `class` keyword (or, with `enum_syntax`,
+    /// `enum Name { A, B = 2, ... }` after `enum`): leaves the class on the stack and
+    /// returns its name. Classes based on `Enum` get their attributes turned into
+    /// members.
+    fn class_value(&mut self, enum_syntax: bool) -> Res<String> {
+        let what = if enum_syntax { "enum" } else { "class" };
+        let name = self.expect_ident(&format!("expected a name after '{}'", what))?;
         let n = self.name_const(&name);
         self.emit(Op::Class(n));
         let mut base = None;
-        if self.matches(&Tok::LParen) {
+        let mut is_enum = enum_syntax;
+        if enum_syntax {
+            let g = self.globals.slot("Enum");
+            self.emit(Op::GetGlobal(g));
+            self.emit(Op::Inherit);
+        } else if self.matches(&Tok::LParen) {
             let start = self.pos;
             self.expression()?;
             base = Some((start, self.pos));
+            let toks: Vec<&Tok> = self.toks[start..self.pos].iter().map(|t| &t.tok).collect();
+            is_enum = matches!(toks.as_slice(), [Tok::Ident(e)] if e == "Enum")
+                || matches!(toks.as_slice(), [Tok::Ident(m), Tok::Dot, Tok::Ident(e)] if m == "enum" && e == "Enum");
             self.expect(Tok::RParen, "expected ')' after superclass")?;
             self.emit(Op::Inherit);
         }
-        self.expect(Tok::LBrace, "expected '{' before class body")?;
+        self.expect(Tok::LBrace, &format!("expected '{{' before {} body", what))?;
         let mut members: HashSet<String> = HashSet::new();
         while !self.check(&Tok::RBrace) && !self.check(&Tok::Eof) {
+            if enum_syntax && matches!(self.peek(), Tok::Ident(_)) {
+                // enum member: NAME or NAME = value, separated by ',' or ';'
+                let m = self.expect_ident("expected a member name")?;
+                if self.matches(&Tok::Assign) {
+                    self.expression()?;
+                } else {
+                    let g = self.globals.slot("$auto");
+                    self.emit(Op::GetGlobal(g));
+                }
+                let mn = self.name_const(&m);
+                self.emit(Op::Method(mn));
+                members.insert(m);
+                if !self.matches(&Tok::Comma) && !self.matches(&Tok::Semi) && !self.check(&Tok::RBrace) {
+                    return Err(self.error("expected ',' between enum members"));
+                }
+                continue;
+            }
             if self.check(&Tok::At) || self.check(&Tok::Def) {
                 // [decorators] def name(self, ...) { ... }
                 let mut ndec = 0;
@@ -1351,8 +1402,373 @@ impl<'g> Compiler<'g> {
                 ));
             }
         }
-        self.expect(Tok::RBrace, "expected '}' after class body")?;
+        self.expect(Tok::RBrace, &format!("expected '}}' after {} body", what))?;
+        if is_enum {
+            // $enum(cls), keeping the class on the stack
+            self.emit(Op::Dup);
+            let g = self.globals.slot("$enum");
+            self.emit(Op::GetGlobal(g));
+            self.emit(Op::Swap);
+            self.emit(Op::Call(1));
+            self.emit(Op::Pop);
+        }
         Ok(name)
+    }
+
+    // ------------------------------------------------------------ match
+
+    /// `match (subject) {` or `match name {` (otherwise `match` is a plain name).
+    fn is_match_start(&self) -> bool {
+        match &self.toks[self.pos + 1].tok {
+            Tok::LParen => match self.skip_group(self.pos + 1, Tok::LParen, Tok::RParen, "") {
+                Ok(i) => self.toks.get(i).is_some_and(|t| t.tok == Tok::LBrace),
+                Err(_) => false,
+            },
+            Tok::Ident(_) => self.toks[self.pos + 2].tok == Tok::LBrace,
+            _ => false,
+        }
+    }
+
+    /// match (subject) { case PATTERN [if guard] { ... } ... }
+    fn match_stmt(&mut self) -> Res<()> {
+        self.advance();
+        if self.check(&Tok::LParen) {
+            self.paren_condition("match")?;
+        } else {
+            self.expression()?;
+        }
+        self.begin_scope();
+        let subject = self.declare_local("(match)", false)?;
+        self.emit(Op::SetLocal(subject));
+        self.expect(Tok::LBrace, "expected '{' after the match subject")?;
+        let mut ends = Vec::new();
+        while !self.check(&Tok::RBrace) && !self.check(&Tok::Eof) {
+            match self.peek() {
+                Tok::Ident(s) if s == "case" => {
+                    self.advance();
+                }
+                _ => return Err(self.error("expected 'case' in a match block")),
+            }
+            self.begin_scope();
+            let mut fails = Vec::new();
+            self.pattern(subject, &mut fails)?;
+            if self.matches(&Tok::If) {
+                self.expression()?;
+                fails.push(self.emit(Op::JumpIfFalse(0)));
+            }
+            self.block()?;
+            self.end_scope();
+            ends.push(self.emit(Op::Jump(0)));
+            for f in fails {
+                self.patch(f);
+            }
+        }
+        self.expect(Tok::RBrace, "expected '}' to close the match block")?;
+        for e in ends {
+            self.patch(e);
+        }
+        self.end_scope();
+        Ok(())
+    }
+
+    /// A fresh hidden local for a sub-value being matched.
+    fn match_temp(&mut self) -> Res<u32> {
+        let n = self.cur().locals.len();
+        self.declare_local(&format!("(pat{})", n), false)
+    }
+
+    /// Binds the value in local `src` to `name` (a capture pattern).
+    fn match_bind(&mut self, src: u32, name: &str) -> Res<()> {
+        let s = self.declare_local(name, false)?;
+        self.emit(Op::GetLocal(src));
+        self.emit(Op::SetLocal(s));
+        Ok(())
+    }
+
+    /// Matches the value in local `src` against a pattern; jumps that leave on a
+    /// mismatch are added to `fails`.
+    fn pattern(&mut self, src: u32, fails: &mut Vec<usize>) -> Res<()> {
+        let mut oks = Vec::new();
+        loop {
+            let mut alt_fails = Vec::new();
+            self.closed_pattern(src, &mut alt_fails)?;
+            if self.matches(&Tok::Pipe) {
+                oks.push(self.emit(Op::Jump(0)));
+                for f in alt_fails {
+                    self.patch(f);
+                }
+                continue;
+            }
+            fails.extend(alt_fails);
+            break;
+        }
+        for o in oks {
+            self.patch(o);
+        }
+        if self.matches(&Tok::As) {
+            let name = self.expect_ident("expected a name after 'as'")?;
+            self.match_bind(src, &name)?;
+        }
+        Ok(())
+    }
+
+    /// Pushes a literal pattern's value: a number (maybe negative), str or bytes.
+    fn pattern_literal(&mut self) -> Res<()> {
+        let neg = self.matches(&Tok::Minus);
+        let v = match self.advance() {
+            Tok::Int(i) => Value::Int(if neg { -i } else { i }),
+            Tok::Float(x) => Value::Float(if neg { -x } else { x }),
+            Tok::Str(s) if !neg => self.heap.string(s),
+            Tok::Bytes(b) if !neg => self.heap.bytes(b),
+            _ => return Err(self.error_prev("expected a literal in the pattern")),
+        };
+        let k = self.add_const(v);
+        self.emit(Op::Const(k));
+        Ok(())
+    }
+
+    /// Pushes `a.b.c` (the first name is already consumed).
+    fn dotted_value(&mut self, first: String) -> Res<()> {
+        self.variable(first, false)?;
+        while self.matches(&Tok::Dot) {
+            let attr = self.expect_ident("expected a name after '.'")?;
+            let s = self.name_const(&attr);
+            self.emit(Op::GetAttr(s));
+        }
+        Ok(())
+    }
+
+    fn closed_pattern(&mut self, src: u32, fails: &mut Vec<usize>) -> Res<()> {
+        match self.peek().clone() {
+            Tok::Int(_) | Tok::Float(_) | Tok::Str(_) | Tok::Bytes(_) | Tok::Minus => {
+                self.emit(Op::GetLocal(src));
+                self.pattern_literal()?;
+                self.emit(Op::Eq);
+                fails.push(self.emit(Op::JumpIfFalse(0)));
+            }
+            Tok::None | Tok::True | Tok::False => {
+                self.emit(Op::GetLocal(src));
+                let op = match self.advance() {
+                    Tok::None => Op::None,
+                    Tok::True => Op::True,
+                    _ => Op::False,
+                };
+                self.emit(op);
+                self.emit(Op::Is);
+                fails.push(self.emit(Op::JumpIfFalse(0)));
+            }
+            Tok::LBracket => {
+                self.advance();
+                self.seq_pattern(src, fails, Tok::RBracket)?;
+            }
+            Tok::LParen => {
+                self.advance();
+                if self.seq_has_comma(Tok::RParen) || self.check(&Tok::RParen) {
+                    self.seq_pattern(src, fails, Tok::RParen)?;
+                } else {
+                    self.pattern(src, fails)?;
+                    self.expect(Tok::RParen, "expected ')' after the pattern")?;
+                }
+            }
+            Tok::LBrace => {
+                self.advance();
+                self.map_pattern(src, fails)?;
+            }
+            Tok::Ident(name) => {
+                self.advance();
+                if self.check(&Tok::Dot) || self.check(&Tok::LParen) {
+                    let start = self.pos - 1;
+                    let mut end = self.pos;
+                    while self.toks[end].tok == Tok::Dot {
+                        end += 2;
+                    }
+                    if self.toks[end].tok == Tok::LParen {
+                        self.class_pattern(src, fails, start, end)?;
+                    } else {
+                        // a value: Color.RED
+                        self.emit(Op::GetLocal(src));
+                        self.dotted_value(name)?;
+                        self.emit(Op::Eq);
+                        fails.push(self.emit(Op::JumpIfFalse(0)));
+                    }
+                } else if name != "_" {
+                    self.match_bind(src, &name)?;
+                }
+            }
+            _ => return Err(self.error("expected a pattern")),
+        }
+        Ok(())
+    }
+
+    /// Is there a top-level ',' before the closing bracket (a sequence, not a group)?
+    fn seq_has_comma(&self, close: Tok) -> bool {
+        let mut depth = 0;
+        let mut i = self.pos;
+        while i < self.toks.len() {
+            match &self.toks[i].tok {
+                Tok::LParen | Tok::LBracket | Tok::LBrace => depth += 1,
+                Tok::RParen | Tok::RBracket | Tok::RBrace if depth > 0 => depth -= 1,
+                t if *t == close && depth == 0 => return false,
+                Tok::Comma if depth == 0 => return true,
+                Tok::Eof => return false,
+                _ => {}
+            }
+            i += 1;
+        }
+        false
+    }
+
+    /// [p, q, *rest, r] / (p, q): the opening bracket is consumed.
+    fn seq_pattern(&mut self, src: u32, fails: &mut Vec<usize>, close: Tok) -> Res<()> {
+        // count the items and find the star first
+        let (mut items, mut star) = (0usize, None);
+        let mut depth = 0;
+        let mut i = self.pos;
+        let mut item_start = true;
+        loop {
+            let t = &self.toks[i].tok;
+            match t {
+                Tok::Eof => return Err(self.error("unclosed pattern")),
+                t if *t == close && depth == 0 => break,
+                Tok::LParen | Tok::LBracket | Tok::LBrace => depth += 1,
+                Tok::RParen | Tok::RBracket | Tok::RBrace => depth -= 1,
+                _ => {}
+            }
+            if depth == 0 && *t == Tok::Comma {
+                item_start = true;
+            } else if item_start {
+                if *t == Tok::Star && depth == 0 {
+                    if star.is_some() {
+                        return Err(self.error("only one '*' is allowed in a sequence pattern"));
+                    }
+                    star = Some(items);
+                }
+                items += 1;
+                item_start = false;
+            }
+            i += 1;
+        }
+        let fixed = items - star.is_some() as usize;
+        self.emit(Op::GetLocal(src));
+        self.emit(Op::MatchSeq(fixed as u32, star.is_some() as u32));
+        fails.push(self.emit(Op::JumpIfFalse(0)));
+        for k in 0..items {
+            if Some(k) == star {
+                self.expect(Tok::Star, "expected '*'")?;
+                let name = self.expect_ident("expected a name after '*'")?;
+                if name != "_" {
+                    let s = self.declare_local(&name, false)?;
+                    self.emit(Op::GetLocal(src));
+                    self.emit(Op::MatchRest(k as u32, (items - 1 - k) as u32));
+                    self.emit(Op::SetLocal(s));
+                }
+            } else {
+                let index = match star {
+                    Some(s) if k > s => -((items - k) as i64),
+                    _ => k as i64,
+                };
+                let tmp = self.match_temp()?;
+                self.emit(Op::GetLocal(src));
+                let c = self.add_const(Value::Int(index));
+                self.emit(Op::Const(c));
+                self.emit(Op::GetIndex);
+                self.emit(Op::SetLocal(tmp));
+                self.pattern(tmp, fails)?;
+            }
+            if k + 1 < items {
+                self.expect(Tok::Comma, "expected ',' between patterns")?;
+            } else {
+                self.matches(&Tok::Comma);
+            }
+        }
+        self.expect(close, "expected the end of the sequence pattern")
+    }
+
+    /// {"key": pattern, ...}: the '{' is consumed.
+    fn map_pattern(&mut self, src: u32, fails: &mut Vec<usize>) -> Res<()> {
+        self.emit(Op::GetLocal(src));
+        self.emit(Op::MatchMap);
+        fails.push(self.emit(Op::JumpIfFalse(0)));
+        while !self.check(&Tok::RBrace) {
+            if self.check(&Tok::StarStar) {
+                return Err(self.error("'**rest' in mapping patterns isn't supported yet"));
+            }
+            let tmp = self.match_temp()?;
+            self.emit(Op::GetLocal(src));
+            match self.peek().clone() {
+                Tok::Ident(n) => {
+                    self.advance();
+                    self.dotted_value(n)?;
+                }
+                Tok::None | Tok::True | Tok::False => {
+                    let op = match self.advance() {
+                        Tok::None => Op::None,
+                        Tok::True => Op::True,
+                        _ => Op::False,
+                    };
+                    self.emit(op);
+                }
+                _ => self.pattern_literal()?,
+            }
+            self.expect(Tok::Colon, "expected ':' after the key")?;
+            self.emit(Op::MatchKey(tmp));
+            fails.push(self.emit(Op::JumpIfFalse(0)));
+            self.pattern(tmp, fails)?;
+            if !self.matches(&Tok::Comma) {
+                break;
+            }
+        }
+        self.expect(Tok::RBrace, "expected '}' after the mapping pattern")
+    }
+
+    /// Point(x, y=0): the class name is the tokens [start, end); the cursor is
+    /// just after the first name.
+    fn class_pattern(&mut self, src: u32, fails: &mut Vec<usize>, start: usize, end: usize) -> Res<()> {
+        let load_class = |c: &mut Self| -> Res<()> {
+            let resume = c.pos;
+            c.pos = start;
+            let first = c.expect_ident("expected a class name")?;
+            c.dotted_value(first)?;
+            let _ = resume;
+            Ok(())
+        };
+        self.emit(Op::GetLocal(src));
+        load_class(self)?;
+        self.expect(Tok::LParen, "expected '('")?;
+        let after = self.pos;
+        let _ = end;
+        self.emit(Op::MatchClass);
+        fails.push(self.emit(Op::JumpIfFalse(0)));
+        let mut i = 0u32;
+        let mut keywords = false;
+        while !self.check(&Tok::RParen) {
+            let tmp = self.match_temp()?;
+            if matches!(self.peek(), Tok::Ident(_)) && self.toks[self.pos + 1].tok == Tok::Assign {
+                let attr = self.expect_ident("expected an attribute name")?;
+                self.advance();
+                let s = self.name_const(&attr);
+                self.emit(Op::GetLocal(src));
+                self.emit(Op::MatchAttr(s, tmp));
+                keywords = true;
+            } else {
+                if keywords {
+                    return Err(self.error("positional patterns must come before keyword patterns"));
+                }
+                self.emit(Op::GetLocal(src));
+                let here = self.pos;
+                load_class(self)?;
+                self.pos = here;
+                self.emit(Op::MatchArg(i, tmp));
+                i += 1;
+            }
+            fails.push(self.emit(Op::JumpIfFalse(0)));
+            self.pattern(tmp, fails)?;
+            if !self.matches(&Tok::Comma) {
+                break;
+            }
+        }
+        let _ = after;
+        self.expect(Tok::RParen, "expected ')' after the class pattern")
     }
 
     /// `@decorator ... def f() {}` / `@decorator class C {}`
@@ -1383,7 +1799,7 @@ impl<'g> Compiler<'g> {
             }
             Tok::Class => {
                 self.advance();
-                let name = self.class_value()?;
+                let name = self.class_value(false)?;
                 for _ in 0..n {
                     self.emit(Op::Call(1));
                 }
@@ -2616,6 +3032,11 @@ impl<'g> Compiler<'g> {
             }
             Tok::Str(s) => {
                 let v = self.heap.string(s);
+                let c = self.add_const(v);
+                self.emit(Op::Const(c));
+            }
+            Tok::Bytes(b) => {
+                let v = self.heap.bytes(b);
                 let c = self.add_const(v);
                 self.emit(Op::Const(c));
             }

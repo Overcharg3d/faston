@@ -235,6 +235,23 @@ pub enum Op {
     /// Suspends the generator, handing the top of the stack to the caller; when it
     /// resumes, the value sent in (None for `next`) is pushed. [v] -> [sent]
     Yield,
+
+    // pattern matching (`match`)
+    /// [v] -> [bool]: v is a list/tuple of exactly n items (at least n if star != 0).
+    MatchSeq(u32, u32),
+    /// [seq] -> [list]: the items between the first `before` and the last `after` (a `*rest`).
+    MatchRest(u32, u32),
+    /// [v] -> [bool]: v is a dict.
+    MatchMap,
+    /// [map, key] -> [bool]; on a hit locals[dst] = map[key].
+    MatchKey(u32),
+    /// [v, cls] -> [bool]: isinstance(v, cls).
+    MatchClass,
+    /// [v, cls] -> [bool]: positional sub-pattern i of a class pattern; on success
+    /// locals[dst] = the attribute named by cls.__match_args__[i] (or init's parameters).
+    MatchArg(u32, u32),
+    /// [v] -> [bool]; when v has attribute `name`, locals[dst] = it.
+    MatchAttr(u32, u32),
 }
 
 impl Op {
@@ -304,6 +321,8 @@ impl Op {
             Op::SetSlice => -5,
             Op::DelSlice => -4,
             Op::Gen | Op::Yield => 0,
+            Op::MatchSeq(..) | Op::MatchRest(..) | Op::MatchMap | Op::MatchAttr(..) => 0,
+            Op::MatchKey(_) | Op::MatchClass | Op::MatchArg(..) => -1,
         }
     }
 
@@ -438,6 +457,135 @@ impl Op {
             ForLoop(a, b, _) => ForLoop(a, b, t),
             SetupTry(_) => SetupTry(t),
             other => other,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------- file encoding
+//
+// Bytecode files (.fbc) store each instruction as its opcode (one byte, the
+// instruction's position in the table below) followed by its operands as u32s.
+// The table also gives each operand's kind, which tells the loader how to check
+// and relocate it:
+//
+//   K  constant index        L  local slot           G  global (file's name table)
+//   S  symbol (file's table)  T  jump target          U  captured-variable index
+//   N  plain number           X  runtime-only (inline-cache data; never in files)
+//
+// New instructions go at the END so existing opcode numbers never change.
+
+macro_rules! op_table {
+    ($($name:ident $(($($f:ident : $k:ident),*))?;)*) => {
+        #[allow(non_camel_case_types, dead_code, clippy::upper_case_acronyms)]
+        #[repr(u8)]
+        enum Code {
+            $($name),*
+        }
+
+        /// (name, operand kinds) of every instruction, indexed by opcode.
+        pub const OPCODES: &[(&str, &str)] = &[
+            $((stringify!($name), concat!("" $($(, stringify!($k))*)?))),*
+        ];
+
+        impl Op {
+            /// Opcode and operands (unused operand slots are 0).
+            pub fn encode(self) -> (u8, [u32; 3]) {
+                match self {
+                    $(Op::$name $(($($f),*))? => (Code::$name as u8, op_table!(@arr $($($f),*)?)),)*
+                }
+            }
+
+            /// The instruction for an opcode and its operands (exactly as many as
+            /// its table entry lists).
+            pub fn decode(code: u8, a: &[u32]) -> Option<Op> {
+                let (_, kinds) = OPCODES.get(code as usize)?;
+                if kinds.len() != a.len() {
+                    return None;
+                }
+                $(if code == Code::$name as u8 {
+                    return Some(op_table!(@build $name, a $(, $($f),*)?));
+                })*
+                None
+            }
+        }
+    };
+    (@arr) => { [0, 0, 0] };
+    (@arr $a:ident) => { [$a, 0, 0] };
+    (@arr $a:ident, $b:ident) => { [$a, $b, 0] };
+    (@arr $a:ident, $b:ident, $c:ident) => { [$a, $b, $c] };
+    (@build $n:ident, $v:ident) => { Op::$n };
+    (@build $n:ident, $v:ident, $a:ident) => { Op::$n($v[0]) };
+    (@build $n:ident, $v:ident, $a:ident, $b:ident) => { Op::$n($v[0], $v[1]) };
+    (@build $n:ident, $v:ident, $a:ident, $b:ident, $c:ident) => { Op::$n($v[0], $v[1], $v[2]) };
+}
+
+op_table! {
+    Const(k: K); None; True; False;
+    Pop; Dup; Dup2; Swap; Rot3;
+    GetLocal(a: L); GetLocal2(a: L, b: L); SetLocal(a: L); AddLocal(a: L);
+    AddLocalL(d: L, s: L); AddLocalC(d: L, k: K);
+    GetGlobal(g: G); SetGlobal(g: G); GetUpval(u: U); SetUpval(u: U);
+    CloseUpvals(a: N); Closure(k: K); ClosureDefaults(k: K, n: N);
+    GetAttr(n: S); SetAttr(n: S); GetLocalAttr(a: L, n: S);
+    GetAttrIC(n: X, c: X, s: X); SetAttrIC(n: X, c: X, s: X); GetLocalAttrIC(n: X, c: X, p: X);
+    SetLocalAttr(a: L, n: S); SetLocalAttrIC(n: X, c: X, p: X);
+    GetIndex; SetIndex;
+    Add; Sub; Mul; Div; FloorDiv; Mod; Pow; Neg; Not; BitAnd; BitOr; BitXor; Shl; Shr; Invert;
+    AddC(k: K); SubC(k: K); MulC(k: K); ModC(k: K);
+    AddLC(a: L, k: K); SubLC(a: L, k: K); MulLC(a: L, k: K); ModLC(a: L, k: K);
+    AddL(a: L); SubL(a: L); MulL(a: L);
+    AddLL(a: L, b: L); SubLL(a: L, b: L); MulLL(a: L, b: L);
+    Eq; Ne; Lt; Le; Gt; Ge; In;
+    EqC(k: K); NeC(k: K); LtC(k: K); LeC(k: K); GtC(k: K); GeC(k: K);
+    Jump(t: T); JumpIfFalse(t: T); JumpIfTrue(t: T); JumpIfFalseOrPop(t: T); JumpIfTrueOrPop(t: T);
+    JumpIfNotEq(t: T); JumpIfNotNe(t: T); JumpIfNotLt(t: T); JumpIfNotLe(t: T); JumpIfNotGt(t: T); JumpIfNotGe(t: T);
+    JumpIfNotEqC(k: K, t: T); JumpIfNotNeC(k: K, t: T); JumpIfNotLtC(k: K, t: T);
+    JumpIfNotLeC(k: K, t: T); JumpIfNotGtC(k: K, t: T); JumpIfNotGeC(k: K, t: T);
+    JumpIfEqC(k: K, t: T); JumpIfNeC(k: K, t: T); JumpIfLtC(k: K, t: T);
+    JumpIfLeC(k: K, t: T); JumpIfGtC(k: K, t: T); JumpIfGeC(k: K, t: T);
+    JumpIfNotEqLC(a: L, k: K, t: T); JumpIfNotNeLC(a: L, k: K, t: T); JumpIfNotLtLC(a: L, k: K, t: T);
+    JumpIfNotLeLC(a: L, k: K, t: T); JumpIfNotGtLC(a: L, k: K, t: T); JumpIfNotGeLC(a: L, k: K, t: T);
+    JumpIfNotEqLL(a: L, b: L, t: T); JumpIfNotNeLL(a: L, b: L, t: T); JumpIfNotLtLL(a: L, b: L, t: T);
+    JumpIfNotLeLL(a: L, b: L, t: T); JumpIfNotGtLL(a: L, b: L, t: T); JumpIfNotGeLL(a: L, b: L, t: T);
+    GetIter(s: L); ForIter(s: L, v: L, t: T); ForLoop(s: L, v: L, t: T);
+    Call(n: N); CallKw(n: N, k: K); CallEx; InvokeKw(m: S, n: N, k: K);
+    ArgPush; ArgExtend; ArgKw; ArgMerge;
+    Invoke(m: S, n: N); InvokeIC(m: X, c: X, p: X); InvokeAppend(m: X); Return;
+    BuildList(n: N); BuildDict(n: N); BuildTuple(n: N); BuildSet(n: N);
+    ListAppend(a: L); SetAdd(a: L); DictSet(a: L); Unpack(n: N); GetSlice; Import(m: S);
+    SetupTry(t: T); PopTry; Raise; ExcMatch(n: N);
+    Class(m: S); Inherit; Method(m: S);
+    Is; DelIndex; DelAttr(m: S); DelGlobal(g: G); SetSlice; DelSlice; Gen; Yield;
+    MatchSeq(n: N, s: N); MatchRest(a: N, b: N); MatchMap; MatchKey(d: L); MatchClass;
+    MatchArg(i: N, d: L); MatchAttr(m: S, d: L);
+}
+
+impl Op {
+    /// How many stack values the instruction reads (its net effect can hide this,
+    /// e.g. `Add` reads 2 and pushes 1). Used to check bytecode files.
+    pub fn pops(self) -> i32 {
+        use Op::*;
+        match self {
+            Add | Sub | Mul | Div | FloorDiv | Mod | Pow | BitAnd | BitOr | BitXor | Shl | Shr => 2,
+            Eq | Ne | Lt | Le | Gt | Ge | In | Is | GetIndex => 2,
+            Neg | Not | Invert | GetAttr(_) | GetAttrIC(..) | Dup | Yield => 1,
+            AddC(_) | SubC(_) | MulC(_) | ModC(_) | AddL(_) | SubL(_) | MulL(_) => 1,
+            EqC(_) | NeC(_) | LtC(_) | LeC(_) | GtC(_) | GeC(_) => 1,
+            Dup2 | Swap => 2,
+            Rot3 => 3,
+            Call(n) | Invoke(_, n) | CallKw(n, _) | InvokeKw(_, n, _) | ExcMatch(n) => n as i32 + 1,
+            InvokeIC(_, _, p) => (p & 0xff) as i32 + 1,
+            InvokeAppend(_) => 2,
+            CallEx => 3,
+            BuildList(n) | BuildTuple(n) | BuildSet(n) | ClosureDefaults(_, n) => n as i32,
+            BuildDict(n) => 2 * n as i32,
+            Unpack(_) => 1,
+            GetSlice => 4,
+            Inherit | Method(_) | ArgPush | ArgExtend | ArgMerge => 2,
+            ArgKw => 3,
+            MatchSeq(..) | MatchRest(..) | MatchMap | MatchAttr(..) => 1,
+            MatchKey(_) | MatchClass | MatchArg(..) => 2,
+            other => (-other.stack_effect()).max(0),
         }
     }
 }

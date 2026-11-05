@@ -29,6 +29,8 @@ pub struct FileObj {
     pub name: String,
     pub mode: String,
     pub stream: Rc<RefCell<Stream>>,
+    /// Opened with 'b': reads give bytes, writes take bytes.
+    pub binary: bool,
 }
 
 pub static FILE_TYPE: HandleType = HandleType {
@@ -84,7 +86,7 @@ fn not_writable() -> String {
 
 fn text(bytes: Vec<u8>) -> Result<String, String> {
     let s = String::from_utf8(bytes).map_err(|_| {
-        "UnicodeError: the file is not valid UTF-8 text (binary files aren't supported yet)".to_string()
+        "UnicodeDecodeError: the file is not valid UTF-8 text (open it in binary mode, 'rb', to read bytes)".to_string()
     })?;
     Ok(if s.contains('\r') { s.replace("\r\n", "\n").replace('\r', "\n") } else { s })
 }
@@ -94,7 +96,7 @@ pub fn new_file(vm: &mut Vm, name: &str, mode: &str, stream: Stream) -> Value {
     if matches!(*rc.borrow(), Stream::Writer(_) | Stream::Update(_)) {
         vm.open_files.push(Rc::downgrade(&rc));
     }
-    let f = FileObj { name: name.to_string(), mode: mode.to_string(), stream: rc };
+    let f = FileObj { name: name.to_string(), mode: mode.to_string(), stream: rc, binary: mode.contains('b') };
     Value::Obj(vm.heap.alloc(Obj::Handle(Box::new(Handle { ty: &FILE_TYPE, data: Box::new(f) }))))
 }
 
@@ -123,10 +125,7 @@ pub fn open_native(vm: &mut Vm, args: &[Value]) -> R {
         }
     }
     let bad_mode = || format!("ValueError: invalid mode: '{}'", mode);
-    if mode.contains('b') {
-        return Err("ValueError: binary mode ('b') isn't supported yet: Faston files are UTF-8 text".into());
-    }
-    if mode.chars().any(|c| !"rwxat+".contains(c)) {
+    if mode.chars().any(|c| !"rwxatb+".contains(c)) || (mode.contains('b') && mode.contains('t')) {
         return Err(bad_mode());
     }
     let primary: Vec<char> = mode.chars().filter(|c| "rwxa".contains(*c)).collect();
@@ -287,8 +286,12 @@ pub fn write_text(vm: &mut Vm, s: &mut Stream, t: &str) -> Result<(), String> {
     r.map_err(|e| os_error(&e, ""))
 }
 
-fn lines_of(vm: &mut Vm, stream: &Rc<RefCell<Stream>>) -> R {
+fn lines_of(vm: &mut Vm, stream: &Rc<RefCell<Stream>>, binary: bool) -> R {
     let all = read_all(&mut stream.borrow_mut())?;
+    if binary {
+        let lines: Vec<Value> = all.split_inclusive(|&b| b == b'\n').map(|l| vm.heap.bytes(l.to_vec())).collect();
+        return Ok(vm.heap.list(lines));
+    }
     let t = text(all)?;
     let lines: Vec<Value> = t.split_inclusive('\n').map(|l| vm.heap.string(l)).collect();
     Ok(vm.heap.list(lines))
@@ -305,6 +308,7 @@ fn file_method(vm: &mut Vm, g: Gc, name: &str, args: &[Value]) -> Option<R> {
     }
     let f = file_of(g);
     let stream = f.stream.clone();
+    let binary = f.binary;
     Some((|| -> R {
         match name {
             "read" => {
@@ -314,6 +318,22 @@ fn file_method(vm: &mut Vm, g: Gc, name: &str, args: &[Value]) -> Option<R> {
                     Some(Value::Int(n)) => *n,
                     Some(v) => return Err(format!("TypeError: read() size must be an int, not '{}'", v.type_name())),
                 };
+                if binary {
+                    let mut v = Vec::new();
+                    let mut s = stream.borrow_mut();
+                    if n < 0 {
+                        v = read_all(&mut s)?;
+                    } else {
+                        let r = match &mut *s {
+                            Stream::Reader(r) => Read::by_ref(r).take(n as u64).read_to_end(&mut v),
+                            Stream::Update(f) => Read::by_ref(f).take(n as u64).read_to_end(&mut v),
+                            Stream::Closed => return Err(closed()),
+                            _ => return Err(not_readable()),
+                        };
+                        r.map_err(|e| os_error(&e, ""))?;
+                    }
+                    return Ok(vm.heap.bytes(v));
+                }
                 let bytes = if n < 0 { read_all(&mut stream.borrow_mut())? } else { read_chars(&mut stream.borrow_mut(), n as usize)? };
                 let t = text(bytes)?;
                 Ok(vm.heap.string(t))
@@ -321,15 +341,35 @@ fn file_method(vm: &mut Vm, g: Gc, name: &str, args: &[Value]) -> Option<R> {
             "readline" => {
                 nargs(name, args, 0, 0)?;
                 let line = read_line(&mut stream.borrow_mut())?;
+                if binary {
+                    return Ok(vm.heap.bytes(line));
+                }
                 let t = text(line)?;
                 Ok(vm.heap.string(t))
             }
             "readlines" | "__iter__" => {
                 nargs(name, args, 0, 0)?;
-                lines_of(vm, &stream)
+                lines_of(vm, &stream, binary)
+            }
+            "write" if binary => {
+                nargs(name, args, 1, 1)?;
+                let b = args[0].as_bytes().ok_or_else(|| {
+                    format!("TypeError: a bytes-like object is required, not '{}'", args[0].type_name())
+                })?;
+                let r = match &mut *stream.borrow_mut() {
+                    Stream::Writer(w) => w.write_all(b),
+                    Stream::Update(f) => f.write_all(b),
+                    Stream::Closed => return Err(closed()),
+                    _ => return Err(not_writable()),
+                };
+                r.map_err(|e| os_error(&e, ""))?;
+                Ok(Value::Int(b.len() as i64))
             }
             "write" => {
                 nargs(name, args, 1, 1)?;
+                if args[0].as_bytes().is_some() {
+                    return Err("TypeError: write() argument must be str, not bytes (open the file in binary mode, 'wb')".into());
+                }
                 let t = want_str_arg(args[0], "write() argument")?;
                 write_text(vm, &mut stream.borrow_mut(), t)?;
                 Ok(Value::Int(t.chars().count() as i64))

@@ -107,6 +107,55 @@ fn built(prog: &Path) -> std::process::Output {
     out
 }
 
+/// Compiles `prog` to a bytecode file next to it (so its imports resolve), runs
+/// that, and removes it. Compile failures come back as the output.
+fn from_bytecode(prog: &Path) -> std::process::Output {
+    let fbc = prog.with_extension("test.fbc");
+    let c = Command::new(env!("CARGO_BIN_EXE_faston"))
+        .arg("compile")
+        .arg(prog)
+        .arg("-o")
+        .arg(&fbc)
+        .output()
+        .expect("failed to run faston compile");
+    if !c.status.success() {
+        return c;
+    }
+    let out = Command::new(env!("CARGO_BIN_EXE_faston")).arg(&fbc).output().expect("failed to run faston");
+    let _ = fs::remove_file(&fbc);
+    out
+}
+
+#[test]
+fn bytecode_files_produce_expected_output() {
+    let mut failures = Vec::new();
+    for prog in programs("cases") {
+        let expected = fs::read_to_string(prog.with_extension("out")).unwrap_or_default();
+        let out = from_bytecode(&prog);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if !out.status.success() || stdout != expected {
+            failures.push(format!(
+                "{} (.fbc)\n--- expected\n{}--- got (exit {:?})\n{}{}",
+                prog.display(),
+                expected,
+                out.status.code(),
+                stdout,
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+    }
+    for prog in programs("errors") {
+        let expected = fs::read_to_string(prog.with_extension("err")).unwrap();
+        let out = from_bytecode(&prog);
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        let missing: Vec<&str> = expected.lines().filter(|l| !l.is_empty() && !text.contains(l)).collect();
+        if out.status.success() || !missing.is_empty() {
+            failures.push(format!("{} (.fbc): missing {:?} in:\n{}", prog.display(), missing, text));
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
 #[test]
 fn built_programs_produce_expected_output() {
     let mut failures = Vec::new();

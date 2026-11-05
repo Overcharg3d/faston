@@ -25,6 +25,8 @@ use crate::value::*;
 
 #[path = "jit_rt.rs"]
 pub mod jit_rt;
+#[path = "fbc.rs"]
+pub mod fbc;
 #[cfg(feature = "jit")]
 #[path = "jit.rs"]
 pub mod jit;
@@ -273,6 +275,12 @@ class TimeoutError(OSError) { pass; }
 class EOFError(Exception) { pass; }
 class ModuleNotFoundError(ImportError) { pass; }
 class UnicodeError(ValueError) { pass; }
+class UnicodeDecodeError(UnicodeError) { pass; }
+class UnicodeEncodeError(UnicodeError) { pass; }
+class Enum {
+    def __str__(self) { return type(self) + "." + self.name; }
+    def __repr__(self) { return "<" + type(self) + "." + self.name + ": " + repr(self.value) + ">"; }
+}
 class JSONDecodeError(ValueError) { pass; }
 class SyntaxError(Exception) { pass; }
 class StopIteration(Exception) { pass; }
@@ -494,6 +502,11 @@ impl Vm {
         {
             self.descriptors = Some([p, s, c]);
         }
+        // `from enum import Enum, auto` (the `enum Name { ... }` syntax needs no import)
+        if let Some(e) = self.builtin_class("Enum") {
+            let auto = self.auto_marker();
+            self.define_module("enum", vec![("Enum", Value::Obj(e)), ("auto", auto)]);
+        }
     }
 
     /// For a value found on a class: 0 = property, 1 = staticmethod, 2 = classmethod
@@ -611,11 +624,7 @@ impl Vm {
 
     /// Compiles `src` into `unit` and returns its top-level function.
     fn compile_unit(&mut self, unit: u32, src: &str) -> Result<Gc, String> {
-        let toks = lexer::lex(src)?;
-        let u = &mut self.units[unit as usize];
-        let script = Compiler::new(toks, &mut u.gtable, &mut self.heap, &mut self.syms, unit).compile()?;
-        let n = u.gtable.names.len();
-        u.globals.resize(n, Value::Undef);
+        let script = self.compile_unit_plain(unit, src)?;
         #[cfg(feature = "jit")]
         if self.aot_out.is_some() {
             // building: save machine code instead of installing it
@@ -632,6 +641,16 @@ impl Vm {
         } else if self.aot.is_some() {
             self.install_aot(src, script);
         }
+        Ok(script)
+    }
+
+    /// Compiles `src` into `unit` (bytecode only).
+    fn compile_unit_plain(&mut self, unit: u32, src: &str) -> Result<Gc, String> {
+        let toks = lexer::lex(src)?;
+        let u = &mut self.units[unit as usize];
+        let script = Compiler::new(toks, &mut u.gtable, &mut self.heap, &mut self.syms, unit).compile()?;
+        let n = u.gtable.names.len();
+        u.globals.resize(n, Value::Undef);
         Ok(script)
     }
 
@@ -759,6 +778,11 @@ impl Vm {
     /// Compiles `src` and returns a human-readable bytecode listing (`faston --dis`).
     pub fn disassemble(&mut self, src: &str) -> Result<String, String> {
         let script = self.compile_unit(self.main, src)?;
+        Ok(self.listing(script))
+    }
+
+    /// Bytecode listing of a module's functions.
+    fn listing(&self, script: Gc) -> String {
         let mut out = String::new();
         let mut todo = vec![script];
         while let Some(g) = todo.pop() {
@@ -780,7 +804,7 @@ impl Vm {
             }
             out.push('\n');
         }
-        Ok(out)
+        out
     }
 
     fn execute(&mut self, script: Gc) -> Result<Value, String> {
@@ -1142,6 +1166,87 @@ impl Vm {
     /// `setattr(obj, name, v)` for natives.
     pub fn set_attr(&mut self, obj: Value, name: u32, v: Value) -> Result<(), String> {
         self.store_attr(obj, name, v).map(|_| ())
+    }
+
+    fn set_frame_local(&mut self, slot: u32, v: Value) {
+        let base = self.frames.last().unwrap().base;
+        self.stack[base + slot as usize] = v;
+    }
+
+    /// `case cls(...)`: is `v` an instance of `cls` (a class or a built-in type)?
+    fn match_class(&mut self, v: Value, cls: Value) -> Result<bool, String> {
+        if let Some(ty) = crate::builtins::builtin_type_name(cls) {
+            return Ok(crate::builtins::is_builtin_instance(v, ty));
+        }
+        match cls {
+            Value::Obj(c) if matches!(c.get(), Obj::Class(_)) => Ok(match v {
+                Value::Obj(g) => match g.get() {
+                    Obj::Instance(i) => Self::is_subclass(Some(i.class), c),
+                    _ => false,
+                },
+                _ => false,
+            }),
+            _ => Err(format!("TypeError: called match pattern must be a class, not '{}'", cls.type_name())),
+        }
+    }
+
+    /// Positional sub-pattern `i` of `case cls(...)`: the attribute it names.
+    fn match_arg(&mut self, v: Value, cls: Value, i: u32) -> Result<Option<Value>, String> {
+        if let Some(ty) = crate::builtins::builtin_type_name(cls) {
+            if i == 0 {
+                return Ok(Some(v));
+            }
+            return Err(format!("TypeError: {}() accepts 1 positional sub-pattern ({} given)", ty, i + 1));
+        }
+        let Value::Obj(c) = cls else { unreachable!() };
+        let class = c.as_class();
+        let names: Vec<u32> = match class.method(sym::D_MATCH_ARGS) {
+            Some(m) => {
+                let mut out = Vec::new();
+                for x in self.to_vec(m)? {
+                    match x.as_str() {
+                        Some(s) => out.push(self.syms.intern(s)),
+                        None => return Err("TypeError: __match_args__ elements must be strings".into()),
+                    }
+                }
+                out
+            }
+            // by default, init's parameters (after self)
+            None => match class.init.map(|f| f.get()) {
+                Some(Obj::Func(f)) => f.params.iter().skip(1).copied().collect(),
+                Some(Obj::Closure(cl)) => cl.func.as_func().params.iter().skip(1).copied().collect(),
+                _ => Vec::new(),
+            },
+        };
+        let Some(&name) = names.get(i as usize) else {
+            return Err(format!(
+                "TypeError: {}() accepts {} positional sub-pattern{} ({} given)",
+                class.name,
+                names.len(),
+                if names.len() == 1 { "" } else { "s" },
+                i + 1
+            ));
+        };
+        Ok(self.load_attr(v, name).ok().map(|(x, _)| x))
+    }
+
+    /// `Color(1)`: the member of an enum with that value.
+    fn enum_lookup(&mut self, cls: Gc, args: &[Value]) -> Result<Value, String> {
+        let name = cls.as_class().name.clone();
+        if args.len() != 1 {
+            return Err(format!("TypeError: {}() takes exactly one argument ({} given)", name, args.len()));
+        }
+        for m in ops::enum_members(Value::Obj(cls)).unwrap_or_default() {
+            if ops::equals(m, args[0]) {
+                return Ok(m);
+            }
+            if let Ok((v, _)) = self.load_attr(m, sym::VALUE) {
+                if ops::equals(v, args[0]) {
+                    return Ok(m);
+                }
+            }
+        }
+        Err(format!("ValueError: {} is not a valid {}", args[0].repr(), name))
     }
 
     /// `len(v)`, honouring `__len__`.
@@ -1990,6 +2095,9 @@ impl Vm {
             sym::SPLIT | sym::RSPLIT => &[sym::SEP, sym::MAXSPLIT],
             sym::SPLITLINES => &[sym::KEEPENDS],
             sym::FORMAT | sym::UPDATE => sym::ANY_KW,
+            sym::DECODE | sym::ENCODE => &[sym::ENCODING, sym::ERRORS],
+            sym::TO_BYTES => &[sym::LENGTH, sym::BYTEORDER, sym::SIGNED],
+            sym::FROM_BYTES => &[sym::BYTEORDER, sym::SIGNED],
             _ => &[],
         };
         let any = allowed.contains(&sym::ANY);
@@ -2085,6 +2193,13 @@ impl Vm {
                 let args =
                     unsafe { std::slice::from_raw_parts(self.stack.as_ptr().add(callee + 1), argc) };
                 let r = (n.func)(self, args)?;
+                self.stack[callee] = r;
+                self.sp = callee + 1;
+                Ok(false)
+            }
+            Obj::Class(c) if c.methods.contains_key(&sym::D_MEMBERS) => {
+                let args = self.stack[callee + 1..callee + 1 + argc].to_vec();
+                let r = self.enum_lookup(g, &args)?;
                 self.stack[callee] = r;
                 self.sp = callee + 1;
                 Ok(false)
@@ -2560,11 +2675,16 @@ impl Vm {
                 Obj::Range(r) => return Ok((Value::Int(r.start), Value::Int(r.stop), Value::Int(r.step))),
                 Obj::List(_) => return Ok((v, Value::Int(0), Value::None)),
                 Obj::Tuple(_) => return Ok((v, Value::Int(0), Value::None)),
-                Obj::Str(_) | Obj::Dict(_) | Obj::Set(_) => {
+                Obj::Str(_) | Obj::Dict(_) | Obj::Set(_) | Obj::Bytes(_) | Obj::ByteArray(_) => {
                     let items = ops::to_vec(&mut self.heap, v)?;
                     return Ok((self.heap.list(items), Value::Int(0), Value::None));
                 }
                 Obj::Generator(_) => return Ok((v, Value::Int(0), Value::None)),
+                Obj::Class(_) => {
+                    if let Some(m) = ops::enum_members(v) {
+                        return Ok((self.heap.list(m), Value::Int(0), Value::None));
+                    }
+                }
                 Obj::Instance(_) => {
                     if dunder(v, sym::D_NEXT).is_some() {
                         let it = self.make_iter(v)?;
@@ -3036,6 +3156,70 @@ impl Vm {
                 let (obj, start, stop, step) = (self.stack[s - 4], self.stack[s - 3], self.stack[s - 2], self.stack[s - 1]);
                 slice_assign(obj, start, stop, step, None)?;
                 self.sp -= 4;
+            }
+            Op::MatchSeq(n, star) => {
+                let v = self.stack[self.sp - 1];
+                let len = match v {
+                    Value::Obj(g) => match g.get() {
+                        Obj::List(l) => Some(l.len()),
+                        Obj::Tuple(t) => Some(t.len()),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let n = n as usize;
+                let ok = len.is_some_and(|l| if star != 0 { l >= n } else { l == n });
+                self.stack[self.sp - 1] = Value::Bool(ok);
+            }
+            Op::MatchRest(before, after) => {
+                let v = self.stack[self.sp - 1];
+                let items = self.to_vec(v)?;
+                let (a, b) = (before as usize, items.len().saturating_sub(after as usize));
+                let rest = if a <= b { items[a..b].to_vec() } else { Vec::new() };
+                self.stack[self.sp - 1] = self.heap.list(rest);
+            }
+            Op::MatchMap => {
+                let v = self.stack[self.sp - 1];
+                let ok = matches!(v, Value::Obj(g) if matches!(g.get(), Obj::Dict(_)));
+                self.stack[self.sp - 1] = Value::Bool(ok);
+            }
+            Op::MatchKey(dst) => {
+                let key = self.spop();
+                let v = self.stack[self.sp - 1];
+                let found = match v {
+                    Value::Obj(g) => match g.get() {
+                        Obj::Dict(d) => d.get(&to_key(key)?),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(x) = found {
+                    self.set_frame_local(dst, x);
+                }
+                self.stack[self.sp - 1] = Value::Bool(found.is_some());
+            }
+            Op::MatchClass => {
+                let cls = self.spop();
+                let v = self.stack[self.sp - 1];
+                let ok = self.match_class(v, cls)?;
+                self.stack[self.sp - 1] = Value::Bool(ok);
+            }
+            Op::MatchArg(i, dst) => {
+                let cls = self.spop();
+                let v = self.stack[self.sp - 1];
+                let r = self.match_arg(v, cls, i)?;
+                if let Some(x) = r {
+                    self.set_frame_local(dst, x);
+                }
+                self.stack[self.sp - 1] = Value::Bool(r.is_some());
+            }
+            Op::MatchAttr(name, dst) => {
+                let v = self.stack[self.sp - 1];
+                let r = self.load_attr(v, name).ok().map(|(x, _)| x);
+                if let Some(x) = r {
+                    self.set_frame_local(dst, x);
+                }
+                self.stack[self.sp - 1] = Value::Bool(r.is_some());
             }
             other => unreachable!("{:?} is handled in the main loop", other),
         }
@@ -4004,6 +4188,82 @@ impl Vm {
             }
             Err(e) => return Err(e),
         }
+        }
+    }
+}
+
+/// `$auto`: the marker for "next value" in an enum (also what `enum.auto()` returns).
+pub fn auto_native(vm: &mut Vm, _args: &[Value]) -> Result<Value, String> {
+    Ok(vm.auto_marker())
+}
+
+/// `$enum(cls)`: turns a class's plain attributes into enum members, in order.
+pub fn enum_class_native(vm: &mut Vm, args: &[Value]) -> Result<Value, String> {
+    let cls = match args.first() {
+        Some(Value::Obj(c)) if matches!(c.get(), Obj::Class(_)) => *c,
+        _ => return Err("TypeError: $enum() needs a class".into()),
+    };
+    let auto = vm.auto_marker();
+    let descriptors = vm.descriptors.unwrap_or([cls, cls, cls]);
+    let class = cls.as_class();
+    let mut attrs: Vec<(u32, u32)> = class.methods.iter().map(|(k, i)| (*k, *i)).collect();
+    attrs.sort_by_key(|&(_, i)| i);
+    let mut members = Dict::default();
+    let mut made: Vec<(Value, Gc)> = Vec::new();
+    let mut last: Option<i64> = None;
+    for (sym_id, idx) in attrs {
+        let name = vm.syms.name(sym_id).to_string();
+        if name.starts_with("__") && name.ends_with("__") {
+            continue;
+        }
+        let v = cls.as_class().method_vals[idx as usize];
+        let skip = match v {
+            Value::Obj(g) => match g.get() {
+                Obj::Func(_) | Obj::Closure(_) | Obj::Native(_) | Obj::Bound(_) | Obj::Class(_) => {
+                    !matches!(v, Value::Obj(a) if matches!(auto, Value::Obj(b) if a == b))
+                }
+                Obj::Instance(i) => descriptors.contains(&i.class),
+                _ => false,
+            },
+            _ => false,
+        };
+        if skip {
+            continue;
+        }
+        let value = if matches!((v, auto), (Value::Obj(a), Value::Obj(b)) if a == b) {
+            Value::Int(last.map_or(1, |n| n + 1))
+        } else {
+            v
+        };
+        if let Value::Int(n) = value {
+            last = Some(n);
+        }
+        let member = match made.iter().find(|(x, _)| ops::equals(*x, value)) {
+            Some((_, m)) => *m, // same value: another name for that member
+            None => {
+                let n = cls.as_class().slot_count as usize;
+                let inst = vm.heap.alloc(Obj::Instance(Instance::new(cls, vec![Value::Undef; n])));
+                let nv = vm.heap.string(name.clone());
+                vm.set_attr(Value::Obj(inst), sym::NAME, nv)?;
+                vm.set_attr(Value::Obj(inst), sym::VALUE, value)?;
+                made.push((value, inst));
+                inst
+            }
+        };
+        cls.as_class_mut().set_method(sym_id, Value::Obj(member));
+        let k = vm.heap.string(name);
+        members.insert(to_key(k)?, k, Value::Obj(member));
+    }
+    let d = vm.heap.dict(members);
+    cls.as_class_mut().set_method(sym::D_MEMBERS, d);
+    Ok(Value::None)
+}
+
+impl Vm {
+    fn auto_marker(&self) -> Value {
+        match self.builtin_names.index.get("$auto") {
+            Some(&g) => self.builtin_values.get(g as usize).copied().unwrap_or(Value::None),
+            None => Value::None,
         }
     }
 }

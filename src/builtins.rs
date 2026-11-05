@@ -104,6 +104,10 @@ pub fn register(vm: &mut Vm) {
     vm.define_native("iter", iter_native);
     vm.define_native("next", next_native);
     vm.define_native("$classof", classof_native);
+    crate::bytesmod::register(vm);
+    crate::vm::fbc::register(vm);
+    vm.define_native("$enum", crate::vm::enum_class_native);
+    vm.define_native("$auto", crate::vm::auto_native);
     register_modules(vm);
 }
 
@@ -785,6 +789,8 @@ fn len(vm: &mut Vm, args: &[Value]) -> R {
             Obj::Tuple(t) => t.len(),
             Obj::Dict(d) | Obj::Set(d) => d.len(),
             Obj::Range(r) => r.len() as usize,
+            Obj::Bytes(b) | Obj::ByteArray(b) => b.len(),
+            Obj::Class(_) => ops::enum_members(args[0]).map_or(usize::MAX, |m| m.len()),
             Obj::Instance(_) => match vm.len_of(args[0])? {
                 Some(n) => n as usize,
                 None => usize::MAX,
@@ -971,6 +977,27 @@ fn type_of(vm: &mut Vm, args: &[Value]) -> R {
     Ok(vm.heap.string(n))
 }
 
+/// The type a built-in type function stands for (`int`, `str`, `list`, ...).
+pub fn builtin_type_name(v: Value) -> Option<&'static str> {
+    match v {
+        Value::Obj(g) => match g.get() {
+            Obj::Native(n) => match n.name {
+                "int" | "float" | "str" | "bool" | "list" | "tuple" | "dict" | "set" | "bytes"
+                | "bytearray" | "range" => Some(n.name),
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `isinstance(v, ty)` for a built-in type name (bool counts as an int, like Python).
+pub fn is_builtin_instance(v: Value, ty: &str) -> bool {
+    let t = v.type_name();
+    t == ty || (ty == "int" && t == "bool")
+}
+
 fn isinstance(vm: &mut Vm, args: &[Value]) -> R {
     check_args("isinstance", args, 2, 2)?;
     if let Some(name) = args[1].as_str() {
@@ -985,6 +1012,9 @@ fn isinstance(vm: &mut Vm, args: &[Value]) -> R {
             }
             return Ok(Value::Bool(false));
         }
+    }
+    if let Some(ty) = builtin_type_name(args[1]) {
+        return Ok(Value::Bool(is_builtin_instance(args[0], ty)));
     }
     let target = match args[1] {
         Value::Obj(g) if matches!(g.get(), Obj::Class(_)) => g,
@@ -1636,8 +1666,15 @@ fn apply_format_spec(v: Value, spec: &str) -> Result<String, String> {
 // ---------------------------------------------------------------- methods
 
 pub fn call_method(vm: &mut Vm, recv: Value, name: u32, args: &[Value]) -> R {
+    if let Value::Int(i) = recv {
+        if let Some(r) = crate::bytesmod::int_method(vm, i, name, args) {
+            return r;
+        }
+    }
     if let Value::Obj(g) = recv {
         let r = match g.get() {
+            Obj::Bytes(_) | Obj::ByteArray(_) => crate::bytesmod::bytes_method(vm, g, name, args),
+            Obj::Native(n) => crate::bytesmod::type_method(vm, n.name, name, args),
             Obj::List(_) => list_method(vm, g, name, args),
             Obj::Str(s) => str_method(vm, s, name, args),
             Obj::Dict(_) => dict_method(vm, g, name, args),
@@ -2376,6 +2413,21 @@ fn str_method(vm: &mut Vm, s: &str, name: u32, args: &[Value]) -> Option<R> {
             sym::ISSPACE => {
                 c(0, 0)?;
                 Ok(Value::Bool(!s.is_empty() && s.chars().all(char::is_whitespace)))
+            }
+            sym::ENCODE => {
+                c(0, 2)?;
+                let enc = vm.take_kw(sym::ENCODING).or(args.first().copied());
+                let err = vm.take_kw(sym::ERRORS).or(args.get(1).copied());
+                let enc = match enc {
+                    Some(e) => want_str(e, "encoding")?,
+                    None => "utf-8",
+                };
+                let err = match err {
+                    Some(e) => want_str(e, "errors")?,
+                    None => "strict",
+                };
+                let b = crate::bytesmod::encode(s, enc, err)?;
+                Ok(vm.heap.bytes(b))
             }
             _ => Err(format!(
                 "AttributeError: 'str' object has no attribute '{}'",

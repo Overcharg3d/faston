@@ -108,6 +108,17 @@ function lex(text, base = 0) {
             i = end;
             continue;
         }
+        // bytes literals: b"..", rb"..", br"..", any case
+        const q1 = text[i + 1] === '"' || text[i + 1] === "'";
+        const q2 = text[i + 2] === '"' || text[i + 2] === "'";
+        const lc = c.toLowerCase(), lc1 = (text[i + 1] || '').toLowerCase();
+        if ((lc === 'b' && q1) || (((lc === 'r' && lc1 === 'b') || (lc === 'b' && lc1 === 'r')) && q2)) {
+            const p = lc === 'b' && q1 ? 1 : 2;
+            const { end, unterminated } = scanString(text, i + p);
+            tokens.push({ t: 'str', v: text.slice(i, end), s: base + i, e: base + end, unterminated, bytes: true });
+            i = end;
+            continue;
+        }
         if ((c === 'r' || c === 'R') && (text[i + 1] === '"' || text[i + 1] === "'")) {
             // raw string: scanString's backslash rule matches Python's raw strings
             const { end, unterminated } = scanString(text, i + 1);
@@ -620,6 +631,74 @@ class Analysis {
             }
 
             if (t.t !== 'id') continue;
+
+            // enum Name { A, B = 2, ...; def m(self) { ... } }
+            if (t.v === 'enum' && atStmt && T[i + 1] && T[i + 1].t === 'id' && T[i + 2] && T[i + 2].v === '{') {
+                const nameTok = T[i + 1];
+                const body = i + 2;
+                const close = M[body];
+                t.skip = true;
+                const sym = this.define(scope, {
+                    name: nameTok.v, kind: 'class', tok: nameTok, base: 'Enum', doc: this.docFor(t),
+                    fullStart: t.s, fullEnd: end(close),
+                });
+                const cs = new Scope('class', nameTok.v, T[body].s, end(close), scope, sym);
+                this.scopes.push(cs);
+                if (sym && sym.tok === nameTok) sym.members = cs;
+                // members: names at the top level of the body (not inside methods)
+                let depth = 0;
+                for (let k = body + 1; k < close; k++) {
+                    const v = T[k].v;
+                    if (T[k].t === 'op' && OPEN[v]) depth++;
+                    else if (T[k].t === 'op' && CLOSE[v]) depth--;
+                    else if (depth === 0 && T[k].t === 'kw' && v === 'def') {
+                        // skip the method: its parameters and body
+                        let m = k + 2;
+                        if (T[m] && T[m].v === '(') m = M[m] + 1;
+                        if (T[m] && T[m].v === '{') k = M[m];
+                        continue;
+                    } else if (depth === 0 && T[k].t === 'id') {
+                        const p = T[k - 1].v, nx = T[k + 1] ? T[k + 1].v : '}';
+                        if ((p === '{' || p === ',' || p === ';') && (nx === ',' || nx === ';' || nx === '}' || nx === '=')) {
+                            this.define(cs, { name: v, kind: 'field', tok: T[k], classSym: sym, hint: { value: 'enum member' } });
+                        }
+                    }
+                }
+                stack.push({ scope: cs, close });
+                i = body;
+                continue;
+            }
+
+            // match (x) { ... }: `match` is only a keyword there
+            if (t.v === 'match' && atStmt && T[i + 1] && (T[i + 1].v === '(' || T[i + 1].t === 'id')) {
+                const after = T[i + 1].v === '(' ? M[i + 1] + 1 : i + 2;
+                if (T[after] && T[after].v === '{') t.skip = true;
+            }
+
+            // case PATTERN [if guard] { ... }: capture names in the pattern are variables
+            if (t.v === 'case' && prev && (prev.v === '{' || prev.v === '}')) {
+                t.skip = true;
+                let depth = 0;
+                let k = i + 1;
+                const startsPattern = (v) => ['case', '|', ',', '(', '[', ':', '{'].includes(v);
+                for (; k < T.length; k++) {
+                    const tk = T[k];
+                    const v = tk.v;
+                    if (tk.t === 'op' && v === '{' && depth === 0 && !startsPattern(T[k - 1].v)) break; // the body
+                    if (tk.t === 'kw' && v === 'if' && depth === 0) break; // guard: normal expression
+                    if (tk.t === 'op' && OPEN[v]) { depth++; continue; }
+                    if (tk.t === 'op' && CLOSE[v]) { depth--; continue; }
+                    if (tk.t !== 'id') continue;
+                    if (v === '_') { tk.skip = true; continue; }
+                    const p = T[k - 1].v, nx = T[k + 1] ? T[k + 1].v : '';
+                    if (p === '.' || nx === '.' || nx === '(') continue; // values and class names
+                    if (nx === '=' && depth > 0) { tk.skip = true; continue; } // Point(x=...): attribute name
+                    if (nx === ':') continue; // mapping key (a value)
+                    this.define(scope, { name: v, kind: 'variable', tok: tk });
+                }
+                i = k - 1;
+                continue;
+            }
 
             // self.field = value  (inside a method)
             if (t.v !== undefined && prev?.v !== '.' && T[i + 1] && T[i + 1].v === '.' && T[i + 2] && T[i + 2].t === 'id'

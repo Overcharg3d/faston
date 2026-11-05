@@ -431,7 +431,7 @@ impl Vm {
 }
 
 /// The base form of an inline-cached instruction (compiled code has its own caches).
-pub(super) fn canon(op: Op) -> Op {
+pub(crate) fn canon(op: Op) -> Op {
     match op {
         Op::GetAttrIC(n, _, _) => Op::GetAttr(n),
         Op::SetAttrIC(n, _, _) => Op::SetAttr(n),

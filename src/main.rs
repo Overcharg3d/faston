@@ -4,6 +4,7 @@
 mod builtins;
 mod bundle;
 mod bytecode;
+mod bytesmod;
 mod compiler;
 mod fileio;
 mod fx;
@@ -52,7 +53,8 @@ fn usage() {
     println!("                                           no file: the project's main file)");
     println!("       faston build [file.fst] [-o name]   build a standalone native executable");
     println!("                    [--full]               (--full: include the gui runtime even if unused)");
-    println!("       faston --dis file.fst               show the compiled bytecode");
+    println!("       faston compile file.fst [-o f.fbc]  compile to a bytecode file (run it with: faston f.fbc)");
+    println!("       faston --dis file.fst               show the compiled bytecode (of a .fst or .fbc file)");
     println!();
     println!("Projects:");
     println!("       faston new name [--lib]             create a project (or a library package)");
@@ -102,8 +104,11 @@ fn real_main() -> i32 {
                 eprintln!("faston: --dis needs a file");
                 process::exit(2);
             });
-            let src = read_file(path);
-            match Vm::new().disassemble(&src) {
+            let listing = match fs::read(path) {
+                Ok(b) if b.starts_with(vm::fbc::MAGIC) => Vm::new().disassemble_bytecode(&b),
+                _ => Vm::new().disassemble(&read_file(path)),
+            };
+            match listing {
                 Ok(listing) => print!("{}", listing),
                 Err(e) => {
                     eprintln!("{}", e);
@@ -166,6 +171,39 @@ fn real_main() -> i32 {
             };
             return bundle::build(&path, out.as_deref(), full);
         }
+        Some("compile") => {
+            let mut out = None;
+            let mut path = None;
+            let mut it = args[2..].iter();
+            while let Some(a) = it.next() {
+                match a.as_str() {
+                    "-o" => out = it.next().cloned(),
+                    p if path.is_none() => path = Some(p.to_string()),
+                    _ => {}
+                }
+            }
+            let Some(path) = path else {
+                eprintln!("faston: compile needs a file");
+                return 2;
+            };
+            let src = read_file(&path);
+            let name = std::path::Path::new(&path).file_name().map_or(path.clone(), |n| n.to_string_lossy().into_owned());
+            let out = out.unwrap_or_else(|| std::path::Path::new(&path).with_extension("fbc").to_string_lossy().into_owned());
+            let mut vm = Vm::new();
+            match vm.compile_to_bytecode(&name, &src) {
+                Ok(b) => {
+                    if let Err(e) = fs::write(&out, &b) {
+                        eprintln!("faston: can't write {}: {}", out, e);
+                        return 1;
+                    }
+                    println!("compiled {} -> {} ({} bytes)", path, out, b.len());
+                }
+                Err(e) => {
+                    eprintln!("{}", e);
+                    return 1;
+                }
+            }
+        }
         Some("new") => return pkg::cmd_new(&args[2..]),
         Some("add") => return pkg::cmd_add(&args[2..]),
         Some("install") => return pkg::cmd_install(),
@@ -176,13 +214,23 @@ fn real_main() -> i32 {
 }
 
 fn run(path: &str, native: bool, program_args: Vec<String>) -> i32 {
-    let src = read_file(path);
+    let bytes = fs::read(path).unwrap_or_else(|e| {
+        eprintln!("faston: can't open '{}': {}", path, e);
+        process::exit(2);
+    });
     let mut vm = if native { Vm::compiled() } else { Vm::new() };
     let mut argv = vec![path.to_string()];
     argv.extend(program_args);
     vm.set_argv(argv);
     let dir = std::path::Path::new(path).parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
     vm.set_sys_path(modules::default_path(dir));
+    if bytes.starts_with(vm::fbc::MAGIC) {
+        return report(vm.run_bytecode_file(path, &bytes));
+    }
+    let src = String::from_utf8(bytes).unwrap_or_else(|_| {
+        eprintln!("faston: '{}' is not UTF-8 text", path);
+        process::exit(2);
+    });
     report(vm.run_file(path, &src))
 }
 

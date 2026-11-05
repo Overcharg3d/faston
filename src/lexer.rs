@@ -8,6 +8,7 @@ pub enum Tok {
     Int(i64),
     Float(f64),
     Str(String),
+    Bytes(Vec<u8>),
     Ident(String),
 
     // keywords
@@ -99,6 +100,7 @@ impl fmt::Display for Tok {
             Tok::Int(i) => write!(f, "{}", i),
             Tok::Float(x) => write!(f, "{}", x),
             Tok::Str(s) => write!(f, "\"{}\"", s),
+            Tok::Bytes(b) => write!(f, "b\"{}\"", String::from_utf8_lossy(b)),
             Tok::Ident(s) => write!(f, "{}", s),
             other => write!(f, "{}", symbol_text(other)),
         }
@@ -182,7 +184,7 @@ fn symbol_text(t: &Tok) -> &'static str {
         Tok::PipeEq => "|=",
         Tok::CaretEq => "^=",
         Tok::Eof => "end of file",
-        Tok::Int(_) | Tok::Float(_) | Tok::Str(_) | Tok::Ident(_) => "",
+        Tok::Int(_) | Tok::Float(_) | Tok::Str(_) | Tok::Bytes(_) | Tok::Ident(_) => "",
     }
 }
 
@@ -246,6 +248,20 @@ impl Lexer {
             } else if (c == 'f' || c == 'F') && (self.peek(1) == '"' || self.peek(1) == '\'') {
                 self.i += 1;
                 self.fstring()?;
+            } else if let Some(n) = self.bytes_prefix() {
+                // b"..." / rb"...": a bytes literal
+                let raw = n == 2;
+                self.i += n;
+                let line = self.line;
+                let s = if raw { self.raw_string()? } else { self.string()? };
+                let mut b = Vec::with_capacity(s.len());
+                for ch in s.chars() {
+                    if (ch as u32) > 0xff {
+                        return Err(self.err("bytes can only contain ASCII characters (use \\x escapes)"));
+                    }
+                    b.push(ch as u32 as u8);
+                }
+                self.out.push(Token { tok: Tok::Bytes(b), line });
             } else if (c == 'r' || c == 'R') && (self.peek(1) == '"' || self.peek(1) == '\'') {
                 // raw string: backslashes are kept as they are (regex patterns, Windows paths)
                 self.i += 1;
@@ -398,6 +414,36 @@ impl Lexer {
         Ok(s)
     }
 
+    /// Length of a bytes-literal prefix at the cursor (`b`, `rb`, `br`, any case)
+    /// followed by a quote: 1 for `b`, 2 for the raw forms.
+    fn bytes_prefix(&self) -> Option<usize> {
+        let q = |c: char| c == '"' || c == '\'';
+        let (a, b, c) = (self.peek(0).to_ascii_lowercase(), self.peek(1).to_ascii_lowercase(), self.peek(2));
+        if a == 'b' && q(self.peek(1)) {
+            Some(1)
+        } else if ((a == 'r' && b == 'b') || (a == 'b' && b == 'r')) && q(c) {
+            Some(2)
+        } else {
+            None
+        }
+    }
+
+    /// `count` hex digits after an escape like `\x`, as a character.
+    fn hex_escape(&mut self, count: usize, what: char) -> Result<char, String> {
+        let mut v: u32 = 0;
+        for _ in 0..count {
+            let d = if self.at_end() { None } else { self.peek(0).to_digit(16) };
+            match d {
+                Some(d) => {
+                    v = v * 16 + d;
+                    self.i += 1;
+                }
+                None => return Err(self.err(&format!("truncated \\{} escape", what))),
+            }
+        }
+        char::from_u32(v).ok_or_else(|| self.err(&format!("invalid \\{} escape", what)))
+    }
+
     /// Reads a quoted string starting at the opening quote; processes escapes.
     fn string(&mut self) -> Result<String, String> {
         let quote = self.peek(0);
@@ -431,6 +477,13 @@ impl Lexer {
                     't' => s.push('\t'),
                     'r' => s.push('\r'),
                     '0' => s.push('\0'),
+                    'a' => s.push('\u{7}'),
+                    'b' => s.push('\u{8}'),
+                    'f' => s.push('\u{c}'),
+                    'v' => s.push('\u{b}'),
+                    'x' => s.push(self.hex_escape(2, 'x')?),
+                    'u' => s.push(self.hex_escape(4, 'u')?),
+                    'U' => s.push(self.hex_escape(8, 'U')?),
                     '\\' => s.push('\\'),
                     '\'' => s.push('\''),
                     '"' => s.push('"'),
