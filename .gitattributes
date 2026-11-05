@@ -2,3 +2,4 @@
 *.out text eol=lf
 *.err text eol=lf
 *.fst text eol=lf
+*.sh text eol=lf
