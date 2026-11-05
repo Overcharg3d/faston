@@ -252,6 +252,8 @@ pub enum Op {
     MatchArg(u32, u32),
     /// [v] -> [bool]; when v has attribute `name`, locals[dst] = it.
     MatchAttr(u32, u32),
+    /// [map, k1..kn] -> [dict]: a copy of the map without those keys (`**rest`).
+    MatchMapRest(u32),
 }
 
 impl Op {
@@ -323,6 +325,7 @@ impl Op {
             Op::Gen | Op::Yield => 0,
             Op::MatchSeq(..) | Op::MatchRest(..) | Op::MatchMap | Op::MatchAttr(..) => 0,
             Op::MatchKey(_) | Op::MatchClass | Op::MatchArg(..) => -1,
+            Op::MatchMapRest(n) => -(n as i32),
         }
     }
 
@@ -557,7 +560,7 @@ op_table! {
     Class(m: S); Inherit; Method(m: S);
     Is; DelIndex; DelAttr(m: S); DelGlobal(g: G); SetSlice; DelSlice; Gen; Yield;
     MatchSeq(n: N, s: N); MatchRest(a: N, b: N); MatchMap; MatchKey(d: L); MatchClass;
-    MatchArg(i: N, d: L); MatchAttr(m: S, d: L);
+    MatchArg(i: N, d: L); MatchAttr(m: S, d: L); MatchMapRest(n: N);
 }
 
 impl Op {
@@ -585,6 +588,7 @@ impl Op {
             ArgKw => 3,
             MatchSeq(..) | MatchRest(..) | MatchMap | MatchAttr(..) => 1,
             MatchKey(_) | MatchClass | MatchArg(..) => 2,
+            MatchMapRest(n) => n as i32 + 1,
             other => (-other.stack_effect()).max(0),
         }
     }

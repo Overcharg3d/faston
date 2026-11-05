@@ -2566,9 +2566,11 @@ impl Vm {
         }
         let unit = self.new_unit(found.display.clone(), Some(found.dir.clone()));
         self.units[unit as usize].package = found.package;
-        let script = self
-            .compile_unit(unit, &found.src)
-            .map_err(|e| format!("File \"{}\": {}", found.display, e))?;
+        let script = match &found.bytecode {
+            Some(code) => self.load_bytecode(code, unit),
+            None => self.compile_unit(unit, &found.src),
+        }
+        .map_err(|e| format!("File \"{}\": {}", found.display, e))?;
         let module = Value::Obj(self.heap.alloc(Obj::Module(ModuleRef { unit, name })));
         self.loaded.insert(key, module);
         if let Some(pu) = parent_unit {
@@ -3212,6 +3214,24 @@ impl Vm {
                     self.set_frame_local(dst, x);
                 }
                 self.stack[self.sp - 1] = Value::Bool(r.is_some());
+            }
+            Op::MatchMapRest(n) => {
+                let n = n as usize;
+                let start = self.sp - n - 1;
+                let mut d = match self.stack[start] {
+                    Value::Obj(g) => match g.get() {
+                        Obj::Dict(d) => (**d).clone(),
+                        _ => Dict::default(),
+                    },
+                    _ => Dict::default(),
+                };
+                for i in 0..n {
+                    let k = self.stack[start + 1 + i];
+                    d.remove(&to_key(k)?);
+                }
+                self.sp = start;
+                let v = self.heap.dict(d);
+                self.spush(v);
             }
             Op::MatchAttr(name, dst) => {
                 let v = self.stack[self.sp - 1];

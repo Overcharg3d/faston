@@ -828,6 +828,12 @@ impl Ctx<'_> {
                 u(Use::Pin(d));
                 st.locals[d as usize] = Ty::Any;
             }
+            Op::MatchMapRest(n) => {
+                for _ in 0..=n {
+                    pop!();
+                }
+                push!(Ty::Any);
+            }
             Op::MatchAttr(_, d) => {
                 pop!();
                 push!(Ty::Bool);
@@ -2371,7 +2377,8 @@ impl Cg<'_> {
             | Op::MatchKey(_)
             | Op::MatchClass
             | Op::MatchArg(..)
-            | Op::MatchAttr(..) => self.cold(op, pre),
+            | Op::MatchAttr(..)
+            | Op::MatchMapRest(_) => self.cold(op, pre),
             other => unreachable!("instruction {:?} reached the code generator", other),
         }
     }

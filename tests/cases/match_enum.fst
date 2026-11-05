@@ -94,3 +94,13 @@ class Weekday(Enum) {
 print(list(Weekday), Weekday.SATURDAY.is_weekend(), Weekday.MONDAY.is_weekend());
 let enum = "still a name";
 print(enum);
+
+# **rest in mapping patterns
+match ({"a": 1, "b": 2, "c": 3}) { case {"a": 1, **rest} { print("rest", rest); } }
+match ({"k": 1}) { case {**everything} { print(everything); } }
+match ({"x": 1}) { case {"x": 1, "y": y, **rest} { print("no"); } case {**r} if len(r) == 1 { print("one key"); } }
+
+# f-string conversions
+let who = "Zoë";
+print(f"{who!r} {who!s} {who!a} [{who!r:>10}] {3 != 4} {[1, 'a']!r} {Color.RED!r} {Color.RED!s}");
+print(ascii("naïve ☃"), ascii([1, "é"]));

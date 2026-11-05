@@ -86,7 +86,7 @@ function lex(text, base = 0) {
                 if (ch === '{' && text[k + 1] === '{') { k += 2; continue; }
                 if (ch === '}' && text[k + 1] === '}') { k += 2; continue; }
                 if (ch === '{') {
-                    let depth = 0, quote = null, colon = -1, m = k + 1;
+                    let depth = 0, quote = null, colon = -1, conv = -1, m = k + 1;
                     for (; m < contentEnd; m++) {
                         const x = text[m];
                         if (quote) { if (x === quote) quote = null; continue; }
@@ -95,8 +95,10 @@ function lex(text, base = 0) {
                         else if (x === ')' || x === ']') depth--;
                         else if (x === '}') { if (depth === 0) break; depth--; }
                         else if (x === ':' && depth === 0 && colon < 0) colon = m;
+                        else if (x === '!' && depth === 0 && colon < 0 && conv < 0 && /[rsa]/.test(text[m + 1] || '')
+                            && (text[m + 2] === ':' || text[m + 2] === '}')) conv = m; // !r / !s / !a
                     }
-                    const exprEnd = colon >= 0 ? colon : m;
+                    const exprEnd = conv >= 0 ? conv : colon >= 0 ? colon : m;
                     const inner = lex(text.slice(k + 1, exprEnd), base + k + 1);
                     groups.push({ s: base + k + 1, e: base + exprEnd, tokens: inner.tokens, spec: colon >= 0 ? { s: base + colon, e: base + m } : null });
                     for (const g of inner.groups) groups.push(g);

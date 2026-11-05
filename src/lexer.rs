@@ -541,6 +541,8 @@ impl Lexer {
                 let mut k = j + 1;
                 let mut quote: Option<char> = None;
                 let mut colon: Option<usize> = None;
+                // `!r` / `!s` / `!a` conversion (not `!=`)
+                let mut conv: Option<(usize, char)> = None;
                 while k < cs.len() {
                     let ch = cs[k];
                     if let Some(q) = quote {
@@ -560,13 +562,21 @@ impl Lexer {
                         depth -= 1;
                     } else if ch == ':' && depth == 0 && colon.is_none() {
                         colon = Some(k);
+                    } else if ch == '!'
+                        && depth == 0
+                        && colon.is_none()
+                        && conv.is_none()
+                        && matches!(cs.get(k + 1), Some('r' | 's' | 'a'))
+                        && matches!(cs.get(k + 2), Some(':' | '}'))
+                    {
+                        conv = Some((k, cs[k + 1]));
                     }
                     k += 1;
                 }
                 if k >= cs.len() {
                     return Err(format!("[line {}] SyntaxError: unterminated '{{' in f-string", line));
                 }
-                let expr_end = colon.unwrap_or(k);
+                let expr_end = conv.map(|(p, _)| p).or(colon).unwrap_or(k);
                 let inner: String = cs[j + 1..expr_end].iter().collect();
                 if inner.trim().is_empty() {
                     return Err(format!("[line {}] SyntaxError: empty expression in f-string", line));
@@ -574,6 +584,20 @@ impl Lexer {
                 let mut inner_toks = lex(&inner)
                     .map_err(|e| format!("[line {}] SyntaxError in f-string: {}", line, e))?;
                 inner_toks.pop(); // Eof
+                if let Some((_, c)) = conv {
+                    let f = match c {
+                        'r' => "$repr",
+                        'a' => "$ascii",
+                        _ => "$str",
+                    };
+                    let mut wrapped = vec![
+                        Token { tok: Tok::Ident(f.into()), line },
+                        Token { tok: Tok::LParen, line },
+                    ];
+                    wrapped.extend(inner_toks);
+                    wrapped.push(Token { tok: Tok::RParen, line });
+                    inner_toks = wrapped;
+                }
                 sep(&mut toks);
                 match colon {
                     // `$fmt` str()-converts plain pieces itself.

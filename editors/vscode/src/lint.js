@@ -62,7 +62,7 @@ function lint(an, opts = {}) {
             });
             continue;
         }
-        for (const n of imp.names || []) {
+        for (const n of mod.opaque ? [] : imp.names || []) {
             if (!mod.module.get(n.name) && !an.getModule(imp.module + '.' + n.name)) {
                 out.push({ s: n.tok.s, e: n.tok.e, severity: 'error', code: 'faston.import', message: `'${n.name}' is not defined at the top level of ${imp.module}.fst.` });
             }

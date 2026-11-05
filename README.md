@@ -275,7 +275,8 @@ flags and tile masks.
   (evaluated eagerly)
 - slicing on lists, tuples and strings: `xs[1:3]`, `s[::-1]`, `xs[-2:]`
 - f-strings with format specs: `f"{fps:.1f}"`, `f"{n:>5}"`, `f"{gold:,}"`,
-  `f"{ratio:.0%}"`, `f"{n:05d}"`, `f"{color:x}"`
+  `f"{ratio:.0%}"`, `f"{n:05d}"`, `f"{color:x}"`, and conversions `f"{name!r}"`
+  (also `!s`, `!a`)
 - `break`, `continue`, `pass;`, `assert cond, "msg";`
 - classes: methods, single inheritance, calling parent methods, fields added
   at any time, bound methods (`f = obj.method;`), `isinstance(obj, Class)`
@@ -289,7 +290,7 @@ flags and tile masks.
 **Pattern matching.** `match` works like Python's: literals, captures, `_`,
 sequences with `*rest`, mappings, class patterns (positional sub-patterns use
 `__match_args__`, or by default `init`'s parameters), alternatives with `|`,
-`as`, and `if` guards. The first matching `case` runs; if none matches,
+`as`, `**rest` in mappings, and `if` guards. The first matching `case` runs; if none matches,
 nothing happens. Capture names are local to their `case`.
 
 ```faston
@@ -484,7 +485,9 @@ imports.
 ### Bytecode files
 
 `faston compile game.fst` writes `game.fbc`, the compiled module, which
-`faston game.fbc` runs without compiling (it imports `.fst` modules as usual).
+`faston game.fbc` runs without compiling. `import name` also finds a compiled
+`name.fbc` when there is no `name.fst` (so a library can ship as bytecode), and
+`faston build` puts such modules into the executable.
 From Faston, the `bytecode` module does the same, and also accepts bytecode
 made some other way, for example by a compiler written in Faston:
 
@@ -551,7 +554,7 @@ TypeError: unsupported operand type(s) for +: 'str' and 'int'
 
 ### Differences from Python (current limitations)
 
-- No `async` yet. f-strings don't support `!r` conversions (use `repr()`).
+- No `async` yet.
 - Generator expressions in parentheses are only allowed as call arguments
   (`sum(x * x for x in xs)`), and are evaluated eagerly.
 - Generator functions run in the interpreter even in native mode (the code
@@ -688,8 +691,7 @@ bench/          benchmarks with CPython equivalents
 An embedding API so a game engine (Rust, C, or a Tauri/JS host) can run Faston
 scripts and register its own functions (`Vm::call` and native functions already
 exist internally); a compiler written in Faston (bootstrapping: the bytecode
-format and the `bytecode` module are the pieces it needs); importing `.fbc`
-modules; networking; native file dialogs for the gui; arbitrary-size
+format and the `bytecode` module are the pieces it needs); networking; native file dialogs for the gui; arbitrary-size
 integers; `async`. For the native compiler: type feedback (record the types
 each operation actually sees, then compile a specialized version) and unboxed
 float fields.

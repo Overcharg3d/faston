@@ -75,7 +75,9 @@ class Project {
             if (m && now - m.at < 1500) return m.an;
             const found = resolveModule(an.uri.fsPath, name);
             let r = null;
-            if (found && found.file) {
+            if (found && found.bytecode) {
+                r = this.compiled(found.bytecode);
+            } else if (found && found.file) {
                 r = this.key(vscode.Uri.file(found.file)) === this.key(an.uri) ? an : this.forPath(found.file);
             } else if (found) {
                 r = this.namespace(found.dir);
@@ -83,6 +85,16 @@ class Project {
             memo.set(name, { at: now, an: r });
             return r;
         };
+    }
+    /** A compiled module (.fbc): an empty analysis that accepts any name. */
+    compiled(file) {
+        const k = 'fbc:' + this.key(vscode.Uri.file(file));
+        const c = this.cache.get(k);
+        if (c) return c.an;
+        const an = new A.Analysis('', vscode.Uri.file(file));
+        an.opaque = true;
+        this.cache.set(k, { stamp: 'fbc', an });
+        return an;
     }
     /** A package directory without __init__.fst: an empty module. */
     namespace(dir) {
@@ -163,6 +175,9 @@ function findIn(dirs, part) {
         if (fs.existsSync(init)) return { file: init, dir: pkg, pkg: true };
         const file = path.join(d, part + '.fst');
         if (fs.existsSync(file)) return { file, dir: d, pkg: false };
+        // a compiled module: importable, but its contents can't be read here
+        const fbc = path.join(d, part + '.fbc');
+        if (fs.existsSync(fbc)) return { file: null, dir: d, pkg: false, bytecode: fbc };
     }
     for (const d of dirs) {
         const pkg = path.join(d, part);
@@ -203,7 +218,7 @@ function siblingModules(an) {
     for (const d of searchDirs(an.uri.fsPath)) {
         try {
             for (const e of fs.readdirSync(d, { withFileTypes: true })) {
-                if (e.isFile() && e.name.endsWith('.fst') && e.name !== self && e.name !== '__init__.fst' && /^[\p{L}_][\p{L}\p{N}_]*\.fst$/u.test(e.name)) {
+                if (e.isFile() && (e.name.endsWith('.fst') || e.name.endsWith('.fbc')) && e.name !== self && e.name !== '__init__.fst' && /^[\p{L}_][\p{L}\p{N}_]*\.f(st|bc)$/u.test(e.name)) {
                     out.add(e.name.slice(0, -4));
                 } else if (e.isDirectory() && /^[\p{L}_][\p{L}\p{N}_]*$/u.test(e.name) && !e.name.startsWith('_') && e.name !== 'target' && e.name !== 'node_modules') {
                     try {

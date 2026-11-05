@@ -126,6 +126,33 @@ fn from_bytecode(prog: &Path) -> std::process::Output {
     out
 }
 
+/// `import lib` finds a compiled `lib.fbc`, also inside a built executable.
+#[test]
+fn imports_bytecode_modules() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("fbc_import");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let faston = env!("CARGO_BIN_EXE_faston");
+    fs::write(dir.join("lib.fst"), "def twice(x) { return x * 2; }\nlet NAME = \"lib\";\n").unwrap();
+    fs::write(dir.join("main.fst"), "import lib;\nprint(lib.twice(21), lib.NAME);\n").unwrap();
+    let c = Command::new(faston).arg("compile").arg(dir.join("lib.fst")).output().unwrap();
+    assert!(c.status.success(), "{}", String::from_utf8_lossy(&c.stderr));
+    fs::remove_file(dir.join("lib.fst")).unwrap();
+    let out = Command::new(faston).arg(dir.join("main.fst")).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42 lib\n", "{}", String::from_utf8_lossy(&out.stderr));
+    // a built program carries the bytecode module
+    let exe = dir.join("main").with_extension(std::env::consts::EXE_EXTENSION);
+    let b = Command::new(faston)
+        .args(["build", dir.join("main.fst").to_str().unwrap(), "-o", exe.to_str().unwrap()])
+        .env("FASTON_RT", faston)
+        .output()
+        .unwrap();
+    assert!(b.status.success(), "{}", String::from_utf8_lossy(&b.stderr));
+    fs::remove_file(dir.join("lib.fbc")).unwrap();
+    let out = Command::new(&exe).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42 lib\n", "{}", String::from_utf8_lossy(&out.stderr));
+}
+
 #[test]
 fn bytecode_files_produce_expected_output() {
     let mut failures = Vec::new();

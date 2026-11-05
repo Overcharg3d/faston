@@ -35,7 +35,7 @@ const KEYWORD_DOCS = {
     continue: 'Skips to the next iteration of the innermost loop.',
     pass: 'Does nothing: `pass;`',
     return: 'Returns from a function. `return a, b;` returns a tuple.',
-    import: 'Imports a module: a built-in one (`math`, `random`, `time`) or `name.fst` next to this file.\n\n```faston\nimport math, enemies;\n```',
+    import: 'Imports a module: a built-in one (`math`, `random`, `time`) or `name.fst` (or a compiled `name.fbc`) next to this file.\n\n```faston\nimport math, enemies;\n```',
     from: 'Imports names from a module.\n\n```faston\nfrom enemies import Slime, spawn;\n```',
     as: 'Names the exception in `except (E as e)`.',
     assert: '```faston\nassert hp >= 0, "hp went negative";\n```\nRaises `AssertionError` when the condition is false.',
@@ -57,6 +57,7 @@ const KEYWORD_DOCS = {
 
 /** @type {Record<string, Fn>} */
 const FUNCTIONS = {
+    ascii: { params: ['x'], doc: 'Like `repr(x)`, with non-ASCII characters escaped (`\\xeb`, `\\u2603`).', returns: 'str' },
     bytes: { params: ['source=b""', 'encoding=None', 'errors="strict"'], doc: 'An immutable byte string: `bytes(3)` (zeros), `bytes([65, 66])`, `bytes("text", "utf-8")`. Literals: `b"\\x00\\xff"`.', returns: 'bytes' },
     bytearray: { params: ['source=b""', 'encoding=None', 'errors="strict"'], doc: 'A mutable byte string (append, extend, item assignment).', returns: 'bytearray' },
     print: { params: ['*values', 'sep=" "', 'end="\\n"'], doc: 'Prints the values, separated by `sep` and followed by `end`.' },

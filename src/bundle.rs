@@ -91,6 +91,27 @@ fn encode(b: &Bundle) -> Vec<u8> {
     out
 }
 
+/// Prefix of bundle entries holding binary module files (bytecode), hex-encoded.
+pub const BINARY_PREFIX: &str = "\0bin:";
+
+fn hex(b: &[u8]) -> String {
+    let mut s = String::with_capacity(b.len() * 2);
+    for x in b {
+        s.push_str(&format!("{:02x}", x));
+    }
+    s
+}
+
+pub fn unhex(s: &str) -> Option<Vec<u8>> {
+    let b = s.as_bytes();
+    if b.len() % 2 != 0 {
+        return None;
+    }
+    b.chunks(2)
+        .map(|p| u8::from_str_radix(std::str::from_utf8(p).ok()?, 16).ok())
+        .collect()
+}
+
 /// Bundle entry holding the program's machine code (binary).
 pub const AOT_KEY: &str = "\0aot";
 
@@ -191,7 +212,14 @@ fn collect(main_dir: &Path, src: &str, vm: &mut Vm) -> HashMap<String, String> {
                     Some(f) => f,
                     None => break, // a missing module fails at run time, as usual
                 };
-                if !found.src.is_empty() || found.display.ends_with(".fst") {
+                if let Some(code) = &found.bytecode {
+                    // a compiled module: stored as hex (its own imports must be
+                    // found at run time, or be bundled through other imports)
+                    let key = crate::modules::relative(&base, &PathBuf::from(&found.key));
+                    if seen_files.insert(key.clone()) {
+                        modules.insert(format!("{}{}", BINARY_PREFIX, key), hex(code));
+                    }
+                } else if !found.src.is_empty() || found.display.ends_with(".fst") {
                     let file = PathBuf::from(&found.key);
                     let key = crate::modules::relative(&base, &file);
                     if seen_files.insert(key.clone()) {
@@ -337,7 +365,7 @@ pub fn build(path: &str, out: Option<&str>, force_gui: bool) -> i32 {
     };
     let runtime_size = exe.len();
     let code_size: usize = aot.as_ref().map_or(0, |a| a.len());
-    let nmods = 1 + modules.keys().filter(|k| !k.starts_with('\0')).count();
+    let nmods = 1 + modules.keys().filter(|k| !k.starts_with('\0') || k.starts_with(BINARY_PREFIX)).count();
     let payload = encode(&Bundle { main_name, main_src: src, modules, aot });
     let mut bytes = exe;
     bytes.extend_from_slice(&payload);

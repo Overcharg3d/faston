@@ -40,3 +40,8 @@ ValueError: 9 is not a valid Color
 stop go
 [<Weekday.MONDAY: 1>, <Weekday.TUESDAY: 2>, <Weekday.FRIDAY: 5>, <Weekday.SATURDAY: 6>] True False
 still a name
+rest {'b': 2, 'c': 3}
+{'k': 1}
+one key
+'Zoë' Zoë 'Zo\xeb' [     'Zoë'] True [1, 'a'] <Color.RED: 1> Color.RED
+'na\xefve \u2603' [1, '\xe9']

@@ -107,8 +107,28 @@ pub fn register(vm: &mut Vm) {
     crate::bytesmod::register(vm);
     crate::vm::fbc::register(vm);
     vm.define_native("$enum", crate::vm::enum_class_native);
+    vm.define_native("$repr", repr);
+    vm.define_native("$str", to_str);
+    vm.define_native("$ascii", ascii_native);
+    vm.define_native("ascii", ascii_native);
     vm.define_native("$auto", crate::vm::auto_native);
     register_modules(vm);
+}
+
+/// `ascii(x)`: repr() with non-ASCII characters escaped.
+fn ascii_native(vm: &mut Vm, args: &[Value]) -> R {
+    check_args("ascii", args, 1, 1)?;
+    let r = vm.repr_of(args[0])?;
+    let mut out = String::with_capacity(r.len());
+    for ch in r.chars() {
+        match ch as u32 {
+            n if n < 0x80 => out.push(ch),
+            n if n < 0x100 => out.push_str(&format!("\\x{:02x}", n)),
+            n if n < 0x10000 => out.push_str(&format!("\\u{:04x}", n)),
+            n => out.push_str(&format!("\\U{:08x}", n)),
+        }
+    }
+    Ok(vm.heap.string(out))
 }
 
 fn iter_native(vm: &mut Vm, args: &[Value]) -> R {

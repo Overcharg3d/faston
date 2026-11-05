@@ -25,6 +25,8 @@ pub struct Found {
     /// Directory its own imports (and, for packages, submodules) are searched in.
     pub dir: PathBuf,
     pub package: bool,
+    /// A compiled module (`name.fbc`) instead of source.
+    pub bytecode: Option<Vec<u8>>,
 }
 
 /// `canonicalize` without Windows' `\\?\` prefix (which git and humans dislike).
@@ -77,6 +79,23 @@ impl Source<'_> {
         }
     }
 
+    /// A binary file (bytecode); bundles keep these in `bundle::BINARY_PREFIX` entries.
+    fn read_bytes(&self, p: &Path) -> Option<Vec<u8>> {
+        match self {
+            Source::Disk => {
+                if p.is_file() {
+                    std::fs::read(p).ok()
+                } else {
+                    None
+                }
+            }
+            Source::Bundle(b) => {
+                let hex = b.get(&format!("{}{}", crate::bundle::BINARY_PREFIX, norm(p)))?;
+                crate::bundle::unhex(hex)
+            }
+        }
+    }
+
     fn is_dir(&self, p: &Path) -> bool {
         match self {
             Source::Disk => p.is_dir(),
@@ -109,6 +128,7 @@ pub fn find(source: &Source, name: &str, dirs: &[PathBuf]) -> Option<Found> {
                 display: format!("{}/__init__.fst", name),
                 dir: pkg,
                 package: true,
+                bytecode: None,
             });
         }
         let file = d.join(format!("{}.fst", name));
@@ -119,13 +139,26 @@ pub fn find(source: &Source, name: &str, dirs: &[PathBuf]) -> Option<Found> {
                 display: format!("{}.fst", name),
                 dir: d.clone(),
                 package: false,
+                bytecode: None,
+            });
+        }
+        // a compiled module (source wins when both exist)
+        let fbc = d.join(format!("{}.fbc", name));
+        if let Some(code) = source.read_bytes(&fbc) {
+            return Some(Found {
+                key: source.key(&fbc),
+                src: String::new(),
+                display: format!("{}.fbc", name),
+                dir: d.clone(),
+                package: false,
+                bytecode: Some(code),
             });
         }
     }
     for d in dirs {
         let pkg = d.join(name);
         if source.is_dir(&pkg) {
-            return Some(Found { key: source.key(&pkg), src: String::new(), display: format!("{}/", name), dir: pkg, package: true });
+            return Some(Found { key: source.key(&pkg), src: String::new(), display: format!("{}/", name), dir: pkg, package: true, bytecode: None });
         }
     }
     None

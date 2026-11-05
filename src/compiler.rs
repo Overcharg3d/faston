@@ -1689,27 +1689,31 @@ impl<'g> Compiler<'g> {
         self.emit(Op::GetLocal(src));
         self.emit(Op::MatchMap);
         fails.push(self.emit(Op::JumpIfFalse(0)));
+        let mut keys = Vec::new();
         while !self.check(&Tok::RBrace) {
-            if self.check(&Tok::StarStar) {
-                return Err(self.error("'**rest' in mapping patterns isn't supported yet"));
+            if self.matches(&Tok::StarStar) {
+                // **rest: the other items, as a new dict
+                let name = self.expect_ident("expected a name after '**'")?;
+                self.matches(&Tok::Comma);
+                if !self.check(&Tok::RBrace) {
+                    return Err(self.error("'**rest' must be the last item of a mapping pattern"));
+                }
+                let resume = self.pos;
+                self.emit(Op::GetLocal(src));
+                for &k in keys.iter() {
+                    self.pos = k;
+                    self.map_key()?;
+                }
+                self.pos = resume;
+                self.emit(Op::MatchMapRest(keys.len() as u32));
+                let s = self.declare_local(&name, false)?;
+                self.emit(Op::SetLocal(s));
+                break;
             }
             let tmp = self.match_temp()?;
             self.emit(Op::GetLocal(src));
-            match self.peek().clone() {
-                Tok::Ident(n) => {
-                    self.advance();
-                    self.dotted_value(n)?;
-                }
-                Tok::None | Tok::True | Tok::False => {
-                    let op = match self.advance() {
-                        Tok::None => Op::None,
-                        Tok::True => Op::True,
-                        _ => Op::False,
-                    };
-                    self.emit(op);
-                }
-                _ => self.pattern_literal()?,
-            }
+            keys.push(self.pos);
+            self.map_key()?;
             self.expect(Tok::Colon, "expected ':' after the key")?;
             self.emit(Op::MatchKey(tmp));
             fails.push(self.emit(Op::JumpIfFalse(0)));
@@ -1719,6 +1723,26 @@ impl<'g> Compiler<'g> {
             }
         }
         self.expect(Tok::RBrace, "expected '}' after the mapping pattern")
+    }
+
+    /// Pushes a mapping pattern's key: a literal or a dotted value.
+    fn map_key(&mut self) -> Res<()> {
+        match self.peek().clone() {
+            Tok::Ident(n) => {
+                self.advance();
+                self.dotted_value(n)
+            }
+            Tok::None | Tok::True | Tok::False => {
+                let op = match self.advance() {
+                    Tok::None => Op::None,
+                    Tok::True => Op::True,
+                    _ => Op::False,
+                };
+                self.emit(op);
+                Ok(())
+            }
+            _ => self.pattern_literal(),
+        }
     }
 
     /// Point(x, y=0): the class name is the tokens [start, end); the cursor is
